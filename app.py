@@ -32,17 +32,19 @@ section[data-testid="stSidebar"] { background-color: #0D1424; border-right: 1px 
 .flag-high   { background: rgba(231,76,60,0.12);  border-left: 4px solid #E74C3C; border-radius: 6px; padding: 10px 14px; margin-bottom: 8px; }
 .flag-medium { background: rgba(243,156,18,0.12); border-left: 4px solid #F39C12; border-radius: 6px; padding: 10px 14px; margin-bottom: 8px; }
 .flag-ok     { background: rgba(39,174,96,0.12);  border-left: 4px solid #27AE60; border-radius: 6px; padding: 10px 14px; margin-bottom: 8px; }
-.signal-buy  { background:#27AE60; color:white; padding:6px 18px; border-radius:20px; font-weight:700; font-size:18px; display:inline-block; }
-.signal-sell { background:#E74C3C; color:white; padding:6px 18px; border-radius:20px; font-weight:700; font-size:18px; display:inline-block; }
-.signal-hold { background:#F39C12; color:white; padding:6px 18px; border-radius:20px; font-weight:700; font-size:18px; display:inline-block; }
-.signal-na   { background:#95A5A6; color:white; padding:6px 18px; border-radius:20px; font-weight:700; font-size:18px; display:inline-block; }
-.sec-title   { font-size:18px; font-weight:700; color:#E2E8F0; margin-bottom:12px; padding-bottom:6px; border-bottom:2px solid #1B4F8A; }
-.card        { background:#111827; border:1px solid #1E2A45; border-radius:10px; padding:20px; margin-bottom:16px; }
-.chart-tip   { text-align:right; font-size:11px; color:#8B9AB5; margin-top:-6px; margin-bottom:10px; }
+.signal-buy       { background:#27AE60; color:white; padding:6px 18px; border-radius:20px; font-weight:700; font-size:18px; display:inline-block; }
+.signal-strong\ buy { background:#1a7a3c; color:white; padding:6px 18px; border-radius:20px; font-weight:700; font-size:18px; display:inline-block; }
+.signal-sell  { background:#E74C3C; color:white; padding:6px 18px; border-radius:20px; font-weight:700; font-size:18px; display:inline-block; }
+.signal-hold  { background:#F39C12; color:white; padding:6px 18px; border-radius:20px; font-weight:700; font-size:18px; display:inline-block; }
+.signal-na    { background:#95A5A6; color:white; padding:6px 18px; border-radius:20px; font-weight:700; font-size:18px; display:inline-block; }
+.sec-title    { font-size:18px; font-weight:700; color:#E2E8F0; margin-bottom:12px; padding-bottom:6px; border-bottom:2px solid #1B4F8A; }
+.card         { background:#111827; border:1px solid #1E2A45; border-radius:10px; padding:20px; margin-bottom:16px; }
+.chart-tip    { text-align:right; font-size:11px; color:#8B9AB5; margin-top:-6px; margin-bottom:10px; }
 .factor-bar-bg { background:#1E2A45; border-radius:6px; height:10px; overflow:hidden; margin-top:4px; }
 .sb-row { display:flex; justify-content:space-between; font-size:11px; color:#B0BCC8; padding:4px 0; border-bottom:1px solid #1E2A45; }
 .sb-val { color:#7EB8F7; font-weight:600; }
 .sb-source { font-size:9px; color:#4A6A8A; font-style:italic; }
+.quality-bar-bg { background:#1E2A45; border-radius:8px; height:14px; overflow:hidden; margin-top:4px; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -65,7 +67,7 @@ def fmt(val, suffix="", prefix="", dec=1, na="—"):
         return na
     try:
         return f"{prefix}{float(val):,.{dec}f}{suffix}"
-    except:
+    except Exception:
         return na
 
 def chart_hint():
@@ -95,6 +97,33 @@ def score_bar_html(score: float, label: str, weight_pct: int) -> str:
         f'</div></div>'
     )
 
+def quality_bar_html(score: float, max_score: float, label: str) -> str:
+    """Render a filled quality score bar (0 to max_score scale)."""
+    pct   = int(score / max_score * 100) if max_score > 0 else 0
+    color = "#27AE60" if pct >= 66 else ("#F39C12" if pct >= 33 else "#E74C3C")
+    return (
+        f'<div style="margin-bottom:10px;">'
+        f'<div style="display:flex;justify-content:space-between;font-size:12px;color:#B0BCC8;">'
+        f'<span>{label}</span>'
+        f'<span style="color:{color};font-weight:700;">{score:.1f} / {max_score:.0f}</span></div>'
+        f'<div class="quality-bar-bg">'
+        f'<div style="height:14px;width:{pct}%;background:{color};border-radius:8px;"></div>'
+        f'</div></div>'
+    )
+
+BIZ_TYPE_LABELS = {
+    "high-margin-stable": ("🏆 High-Margin Stable",  "#27AE60"),
+    "stable":             ("✅ Stable",               "#4A90D9"),
+    "cyclical":           ("🔄 Cyclical",             "#F39C12"),
+    "commodity":          ("🪨 Commodity",            "#E74C3C"),
+}
+BIZ_TYPE_TOOLTIPS = {
+    "high-margin-stable": "High OPM (≥18%), low revenue volatility, consistent FCF — e.g. IT, pharma, FMCG.",
+    "stable":             "Moderate-to-good margins, predictable demand — e.g. consumer, banks.",
+    "cyclical":           "Revenue highly sensitive to economic cycles — e.g. auto, infra, metals.",
+    "commodity":          "Thin margins, price-taker dynamics — e.g. steel, cement, oil & gas.",
+}
+
 
 # ── Session state: flat keys for assumptions + report cache ──
 _DEFAULT_AA = {
@@ -120,10 +149,15 @@ _DEFAULT_AA = {
     "aa_raw_growth_pct":     12.0,
     "aa_ticker":             "",
     "aa_is_derived":         False,
+    "aa_business_type":      "stable",
+    "aa_quality_score":      0.0,
     # signal cache
     "sig_signal":            "",
     "sig_conviction":        "",
     "sig_composite_score":   0.0,
+    "sig_mos_required":      20.0,
+    "sig_quality_score":     0.0,
+    "sig_business_type":     "stable",
     # cagr cache for sidebar display
     "cagr3":                 None,
     "cagr5":                 None,
@@ -167,6 +201,8 @@ def _write_aa(d: dict):
         "cost_of_debt":       "aa_cost_of_debt",
         "de_ratio":           "aa_de_ratio",
         "raw_growth_pct":     "aa_raw_growth_pct",
+        "business_type":      "aa_business_type",
+        "quality_score":      "aa_quality_score",
     }
     for src, dst in mapping.items():
         if src in d:
@@ -203,17 +239,33 @@ with st.sidebar:
 
     st.divider()
 
-    # ── DCF Assumptions panel ──
-    aa            = _read_aa()
-    is_derived    = st.session_state["aa_is_derived"]
-    derived_for   = st.session_state["aa_ticker"]
+    # ── Business type + Quality badge ──
+    aa           = _read_aa()
+    is_derived   = st.session_state["aa_is_derived"]
+    derived_for  = st.session_state["aa_ticker"]
 
     if is_derived and derived_for:
+        biz_type   = st.session_state.get("aa_business_type", "stable")
+        qs         = st.session_state.get("aa_quality_score",  0.0)
+        biz_label, biz_color = BIZ_TYPE_LABELS.get(biz_type, ("Stable", "#4A90D9"))
+        qs_color = "#27AE60" if qs >= 70 else ("#F39C12" if qs >= 45 else "#E74C3C")
+
         st.markdown(
             f'<div style="display:flex;align-items:center;gap:6px;margin-bottom:6px;">'
             f'<span style="font-size:14px;font-weight:700;color:#E2E8F0;">🤖 DCF Assumptions</span>'
             f'<span style="font-size:10px;background:#1B3A5C;color:#7EB8F7;'
             f'border-radius:10px;padding:2px 8px;">Auto · {derived_for}</span>'
+            f'</div>',
+            unsafe_allow_html=True,
+        )
+        # Business type + quality row
+        st.markdown(
+            f'<div style="display:flex;gap:6px;margin-bottom:8px;">'
+            f'<span style="font-size:11px;background:{biz_color}22;color:{biz_color};'
+            f'border:1px solid {biz_color}44;border-radius:10px;padding:2px 9px;">{biz_label}</span>'
+            f'<span style="font-size:11px;background:{qs_color}22;color:{qs_color};'
+            f'border:1px solid {qs_color}44;border-radius:10px;padding:2px 9px;">'
+            f'Quality {qs:.0f}/100</span>'
             f'</div>',
             unsafe_allow_html=True,
         )
@@ -276,29 +328,31 @@ with st.sidebar:
         de_r = aa["de_ratio"]
 
         if is_derived:
+            biz_type = aa.get("business_type", "stable")
             rows_html = (
-                _sb_row("Base Growth",     f"{aa['base_growth']*100:.1f}%",
+                _sb_row("Business Type",  BIZ_TYPE_LABELS.get(biz_type, ("stable",""))[0]) +
+                _sb_row("Base Growth",    f"{aa['base_growth']*100:.1f}%",
                         f"3Y/5Y CAGR {c3}/{c5}") +
-                _sb_row("Bear Growth",     f"{aa['bear_growth']*100:.1f}%",  "50% of base") +
-                _sb_row("Bull Growth",     f"{aa['bull_growth']*100:.1f}%",  "160% of base") +
-                _sb_row("EBITDA Margin",   f"{aa['base_ebitda_margin']:.1f}%","5Y median") +
-                _sb_row("WACC",            f"{aa['base_wacc']*100:.1f}%",
+                _sb_row("Bear Growth",    f"{aa['bear_growth']*100:.1f}%",  "50% of base") +
+                _sb_row("Bull Growth",    f"{aa['bull_growth']*100:.1f}%",  "160% of base") +
+                _sb_row("EBITDA Margin",  f"{aa['base_ebitda_margin']:.1f}%","5Y median") +
+                _sb_row("WACC",           f"{aa['base_wacc']*100:.1f}%",
                         f"β={aa['beta']:.2f}, D/E={de_r:.2f}x") +
-                _sb_row("Terminal Growth", f"{aa['base_tgr']*100:.1f}%",     "½×base, 3-6%") +
-                _sb_row("Capex % Rev",     f"{aa['capex_pct']*100:.1f}%",    "5Y median") +
-                _sb_row("Tax Rate",        f"{aa['tax_rate']*100:.0f}%",     "assumed") +
-                _sb_row("Cost of Debt",    f"{aa['cost_of_debt']*100:.1f}%", "interest/debt")
+                _sb_row("Terminal Growth",f"{aa['base_tgr']*100:.1f}%", "GDP/2, type-adj") +
+                _sb_row("Capex % Rev",    f"{aa['capex_pct']*100:.1f}%",   "5Y median") +
+                _sb_row("Tax Rate",       f"{aa['tax_rate']*100:.0f}%",    "effective rate") +
+                _sb_row("Cost of Debt",   f"{aa['cost_of_debt']*100:.1f}%","interest/debt")
             )
         else:
             rows_html = (
-                _sb_row("Base Growth",     f"{aa['base_growth']*100:.1f}%") +
-                _sb_row("Bear Growth",     f"{aa['bear_growth']*100:.1f}%") +
-                _sb_row("Bull Growth",     f"{aa['bull_growth']*100:.1f}%") +
-                _sb_row("EBITDA Margin",   f"{aa['base_ebitda_margin']:.1f}%") +
-                _sb_row("WACC",            f"{aa['base_wacc']*100:.1f}%") +
-                _sb_row("Terminal Growth", f"{aa['base_tgr']*100:.1f}%") +
-                _sb_row("Capex % Rev",     f"{aa['capex_pct']*100:.1f}%") +
-                _sb_row("Tax Rate",        f"{aa['tax_rate']*100:.0f}%")
+                _sb_row("Base Growth",    f"{aa['base_growth']*100:.1f}%") +
+                _sb_row("Bear Growth",    f"{aa['bear_growth']*100:.1f}%") +
+                _sb_row("Bull Growth",    f"{aa['bull_growth']*100:.1f}%") +
+                _sb_row("EBITDA Margin",  f"{aa['base_ebitda_margin']:.1f}%") +
+                _sb_row("WACC",           f"{aa['base_wacc']*100:.1f}%") +
+                _sb_row("Terminal Growth",f"{aa['base_tgr']*100:.1f}%") +
+                _sb_row("Capex % Rev",    f"{aa['capex_pct']*100:.1f}%") +
+                _sb_row("Tax Rate",       f"{aa['tax_rate']*100:.0f}%")
             )
 
         st.markdown(
@@ -309,11 +363,12 @@ with st.sidebar:
 
         # Mini signal badge (only when a report has been run)
         if is_derived:
-            signal = st.session_state["sig_signal"]
-            conv   = st.session_state["sig_conviction"]
-            score  = st.session_state["sig_composite_score"]
+            signal  = st.session_state["sig_signal"]
+            conv    = st.session_state["sig_conviction"]
+            score   = st.session_state["sig_composite_score"]
+            mos_req = st.session_state.get("sig_mos_required", 20.0)
             if signal:
-                sig_color = {"BUY":"#27AE60","SELL":"#E74C3C","HOLD":"#F39C12"}.get(signal,"#95A5A6")
+                sig_color = {"BUY":"#27AE60","STRONG BUY":"#1a7a3c","SELL":"#E74C3C","HOLD":"#F39C12"}.get(signal,"#95A5A6")
                 st.markdown(
                     f'<div style="display:flex;align-items:center;gap:8px;'
                     f'background:#0A0F1E;border:1px solid {sig_color}44;border-radius:8px;'
@@ -322,7 +377,8 @@ with st.sidebar:
                     f'padding:2px 10px;font-weight:700;font-size:13px;">{signal}</span>'
                     f'<div style="font-size:10px;color:#8B9AB5;line-height:1.6;">'
                     f'{conv} conviction<br>'
-                    f'<span style="color:{sig_color};font-weight:600;">Score {score:+.2f}</span>'
+                    f'<span style="color:{sig_color};font-weight:600;">Score {score:+.2f}</span><br>'
+                    f'<span style="color:#8B9AB5;">MOS reqd: {mos_req:.0f}%</span>'
                     f'</div></div>',
                     unsafe_allow_html=True,
                 )
@@ -353,7 +409,7 @@ if not generate_btn and st.session_state["report_data"] is None:
         (c1,"📈","5-Year Financials","Revenue, PAT, EBITDA, EPS, CFO & FCF"),
         (c2,"🧮","20+ Ratios","Profitability, liquidity, solvency & valuation"),
         (c3,"⚠️","Red Flags","10 automated checks with explanations"),
-        (c4,"🎯","Smart DCF","History-derived assumptions + composite signal"),
+        (c4,"🎯","Smart DCF","Quality-scored, business-type-aware signals"),
     ]:
         with col:
             st.markdown(
@@ -399,10 +455,17 @@ if generate_btn and ticker_input:
         upd(25, "Calculating ratios...")
         r = calculate_ratios(data)
 
-        upd(33, "Deriving DCF assumptions from historical data...")
-        auto_assum = derive_assumptions_from_history(data, r)
+        # Fetch peers first so peer_df is available for margin benchmarking
+        peer_data_list, peer_df = [], None
+        if fetch_peers and data.get("peers"):
+            upd(35, f"Fetching peers: {', '.join(data['peers'][:n_peer_limit])}...")
+            peer_data_list = fetch_peer_data(data["peers"][:n_peer_limit], delay=1.0)
+            peer_df = build_peer_comparison(ticker, data, r, peer_data_list)
 
-        # ── Write derived assumptions into session state ──
+        upd(45, "Deriving DCF assumptions from historical data...")
+        auto_assum = derive_assumptions_from_history(data, r, peer_df)
+
+        # Write derived assumptions into session state
         _write_aa(auto_assum)
         st.session_state["aa_ticker"]     = ticker
         st.session_state["aa_is_derived"] = True
@@ -414,40 +477,37 @@ if generate_btn and ticker_input:
         final_assumptions = (dcf_assumptions if allow_override
                              else {**auto_assum, "auto_derived": True})
 
-        upd(40, "Red flag analysis...")
+        upd(55, "Red flag analysis...")
         flags     = detect_red_flags(r)
         flag_summ = flags_summary(flags)
 
-        peer_data_list, peer_df = [], None
-        if fetch_peers and data.get("peers"):
-            upd(50, f"Fetching peers: {', '.join(data['peers'][:n_peer_limit])}...")
-            peer_data_list = fetch_peer_data(data["peers"][:n_peer_limit], delay=1.0)
-            peer_df = build_peer_comparison(ticker, data, r, peer_data_list)
-
         dcf_result = None
         if run_dcf_opt:
-            upd(63, "Running DCF valuation...")
+            upd(65, "Running DCF valuation...")
             dcf_result = run_three_scenarios(data, r, final_assumptions)
             # Cache signal for sidebar badge
             st.session_state["sig_signal"]          = dcf_result.get("signal", "")
             st.session_state["sig_conviction"]      = dcf_result.get("conviction", "")
             st.session_state["sig_composite_score"] = dcf_result.get("composite_score", 0.0)
+            st.session_state["sig_mos_required"]    = dcf_result.get("mos_required", 20.0)
+            st.session_state["sig_quality_score"]   = dcf_result.get("quality_score", 0.0)
+            st.session_state["sig_business_type"]   = dcf_result.get("business_type", "stable")
 
         mc_result = None
         if run_mc_opt and run_dcf_opt:
-            upd(74, "Monte Carlo simulation (10,000 runs)...")
+            upd(77, "Monte Carlo simulation (10,000 runs)...")
             mc_result = run_monte_carlo(data, r, final_assumptions)
 
         sens_df = None
         if run_dcf_opt:
-            upd(83, "Sensitivity analysis...")
+            upd(85, "Sensitivity analysis...")
             sens_df = run_sensitivity(data, r, final_assumptions)
 
-        upd(91, "Generating PDF & Excel...")
+        upd(93, "Generating PDF & Excel...")
         pdf_bytes   = generate_pdf(ticker, data, r, flags, peer_df, dcf_result)
         excel_bytes = export_excel(ticker, data, r, flags, peer_df, dcf_result)
 
-        # ── Store entire report in session state ──
+        # Store entire report in session state
         st.session_state["report_data"] = {
             "ticker": ticker, "data": data, "r": r,
             "flags": flags, "flag_summ": flag_summ,
@@ -463,7 +523,7 @@ if generate_btn and ticker_input:
         prog.empty()
         stat.empty()
 
-        # ── Rerun: sidebar now reads updated session state ──
+        # Rerun so sidebar reads updated session state
         st.rerun()
 
     except Exception as e:
@@ -502,7 +562,21 @@ price     = data.get("current_price")
 mktcap    = data.get("market_cap")
 price_str = f"₹{price:,.2f}" if price else "—"
 w52_str   = f"52W: {fmt(data.get('low_52w'), prefix='₹', dec=0)} – {fmt(data.get('high_52w'), prefix='₹', dec=0)}"
-sector_str= f" &nbsp;•&nbsp; {data.get('sector','')}" if data.get('sector') else ""
+sector_str = f" &nbsp;•&nbsp; {data.get('sector','')}" if data.get('sector') else ""
+
+# Quality + Business type badge for header
+_biz      = final_assumptions.get("business_type", "stable")
+_qs       = final_assumptions.get("quality_score", 0.0)
+_biz_lbl, _biz_col = BIZ_TYPE_LABELS.get(_biz, ("Stable", "#4A90D9"))
+_qs_col   = "#27AE60" if _qs >= 70 else ("#F39C12" if _qs >= 45 else "#E74C3C")
+_biz_badges = (
+    f'<span style="font-size:11px;background:{_biz_col}22;color:{_biz_col};'
+    f'border:1px solid {_biz_col}44;border-radius:10px;padding:2px 9px;margin-right:6px;">'
+    f'{_biz_lbl}</span>'
+    f'<span style="font-size:11px;background:{_qs_col}22;color:{_qs_col};'
+    f'border:1px solid {_qs_col}44;border-radius:10px;padding:2px 9px;">'
+    f'Quality {_qs:.0f}/100</span>'
+) if final_assumptions.get("auto_derived") else ""
 
 st.markdown(
     f'<div class="card" style="display:flex;justify-content:space-between;'
@@ -510,6 +584,7 @@ st.markdown(
     f'<div>'
     f'<div style="font-size:26px;font-weight:800;color:#E2E8F0;">{company}</div>'
     f'<div style="font-size:14px;color:#8B9AB5;margin-top:4px;">NSE: {ticker}{sector_str}</div>'
+    f'<div style="margin-top:8px;">{_biz_badges}</div>'
     f'</div>'
     f'<div style="text-align:right;">'
     f'<div style="font-size:32px;font-weight:800;color:#4A90D9;">{price_str}</div>'
@@ -549,7 +624,9 @@ with dl3:
         base_iv    = dcf_result.get("base_iv")
         upside     = dcf_result.get("upside_pct")
         comp_score = dcf_result.get("composite_score", 0)
+        mos_req    = dcf_result.get("mos_required", 20.0)
         auto_tag   = "🤖 Auto" if final_assumptions.get("auto_derived") else "✏️ Manual"
+        sig_color  = {"BUY":"#27AE60","STRONG BUY":"#1a7a3c","SELL":"#E74C3C","HOLD":"#F39C12"}.get(signal,"#95A5A6")
         st.markdown(
             f'<div style="display:flex;align-items:center;gap:16px;padding:8px 0;">'
             f'<span class="signal-{signal.lower()}">{signal}</span>'
@@ -559,7 +636,8 @@ with dl3:
             f'<span style="font-size:11px;color:#8B9AB5;">({conviction} conviction)</span></div>'
             f'<div style="color:#8B9AB5;font-size:12px;">'
             f'Composite: {comp_score:+.2f} &nbsp;|&nbsp; '
-            f'DCF upside: {fmt(upside,"%")} &nbsp;|&nbsp; {auto_tag} assumptions</div>'
+            f'DCF upside: {fmt(upside,"%")} &nbsp;|&nbsp; '
+            f'MOS reqd: {mos_req:.0f}% &nbsp;|&nbsp; {auto_tag}</div>'
             f'</div></div>',
             unsafe_allow_html=True,
         )
@@ -570,9 +648,10 @@ st.divider()
 # ══════════════════════════════════════════
 # TABS
 # ══════════════════════════════════════════
-tab_fin, tab_rat, tab_cf, tab_flags, tab_dupont, tab_peers, tab_dcf, tab_mc = st.tabs([
+(tab_fin, tab_rat, tab_cf, tab_flags, tab_quality,
+ tab_dupont, tab_peers, tab_dcf, tab_mc) = st.tabs([
     "📈 Financials","🧮 Ratios","📊 Cash Flow","⚠️ Red Flags",
-    "🔄 DuPont","🏢 Peers","🎯 DCF Valuation","🎲 Monte Carlo",
+    "🏅 Business Quality","🔄 DuPont","🏢 Peers","🎯 DCF Valuation","🎲 Monte Carlo",
 ])
 
 # ── TAB 1: FINANCIALS ──
@@ -677,7 +756,7 @@ with tab_cf:
             try:
                 fc, fp = float(c), float(p)
                 cfo_pat.append(f"{fc/fp:.2f}x" if fp!=0 and not np.isnan(fc) and not np.isnan(fp) else "—")
-            except:
+            except Exception:
                 cfo_pat.append("—")
         cf_df = pd.DataFrame({
             "CFO (₹ Cr)":r.get("cfo",[]),"CFI (₹ Cr)":r.get("cfi",[]),
@@ -696,8 +775,7 @@ with tab_cf:
         if not raw_cf.empty:
             st.dataframe(raw_cf, use_container_width=True)
         else:
-            st.info("Not available.")
-# ── TAB 4: RED FLAGS ──
+            st.info("Not available.")# ── TAB 4: RED FLAGS ──
 with tab_flags:
     sec("Red Flag Analysis")
     rfc = st.columns(3)
@@ -728,7 +806,132 @@ with tab_flags:
             unsafe_allow_html=True,
         )
 
-# ── TAB 5: DUPONT ──
+# ── TAB 5: BUSINESS QUALITY ──
+with tab_quality:
+    qs = final_assumptions.get("quality_score", 0.0)
+    qc = final_assumptions.get("quality_components", {})
+    biz_type = final_assumptions.get("business_type", "stable")
+    biz_label, biz_color = BIZ_TYPE_LABELS.get(biz_type, ("Stable","#4A90D9"))
+    biz_tooltip = BIZ_TYPE_TOOLTIPS.get(biz_type, "")
+    qs_color = "#27AE60" if qs >= 70 else ("#F39C12" if qs >= 45 else "#E74C3C")
+
+    sec("Business Classification & Quality Score")
+
+    # Business type card
+    st.markdown(
+        f'<div class="card" style="border-color:{biz_color}44;">'
+        f'<div style="font-size:11px;color:#8B9AB5;text-transform:uppercase;letter-spacing:1px;margin-bottom:6px;">Business Type</div>'
+        f'<div style="display:flex;align-items:center;gap:12px;">'
+        f'<span style="font-size:22px;font-weight:800;color:{biz_color};">{biz_label}</span>'
+        f'</div>'
+        f'<div style="font-size:12px;color:#B0BCC8;margin-top:8px;">{biz_tooltip}</div>'
+        f'<div style="margin-top:12px;font-size:11px;color:#8B9AB5;line-height:1.8;">'
+        f'<strong style="color:#B0BCC8;">Growth ceiling:</strong> '
+        f'{"30%" if biz_type=="high-margin-stable" else "25%" if biz_type=="stable" else "20%" if biz_type=="cyclical" else "18%"}'
+        f' &nbsp;|&nbsp; '
+        f'<strong style="color:#B0BCC8;">MOS premium:</strong> '
+        f'{"No extra" if biz_type in ("high-margin-stable","stable") else "+3%" if biz_type=="cyclical" else "+5%"}'
+        f' &nbsp;|&nbsp; '
+        f'<strong style="color:#B0BCC8;">Beta prior:</strong> '
+        f'{"0.70" if biz_type=="high-margin-stable" else "0.80" if biz_type=="stable" else "1.00" if biz_type=="cyclical" else "1.10"}'
+        f'</div></div>',
+        unsafe_allow_html=True,
+    )
+
+    # Overall quality score
+    st.markdown(
+        f'<div class="card" style="text-align:center;border-color:{qs_color};">'
+        f'<div style="font-size:11px;color:#8B9AB5;text-transform:uppercase;letter-spacing:1px;margin-bottom:8px;">Overall Business Quality Score</div>'
+        f'<div style="font-size:52px;font-weight:800;color:{qs_color};">{qs:.0f}</div>'
+        f'<div style="font-size:14px;color:#8B9AB5;">out of 100</div>'
+        f'<div style="margin-top:12px;font-size:12px;color:#B0BCC8;">'
+        f'{"🏆 High quality — deserves a premium valuation" if qs >= 70 else "⚠️ Moderate quality — invest with appropriate margin of safety" if qs >= 45 else "🔴 Low quality — avoid BUY; monitor improvement"}'
+        f'</div></div>',
+        unsafe_allow_html=True,
+    )
+
+    # Component breakdown
+    sec("Quality Component Breakdown")
+    q_col1, q_col2 = st.columns(2)
+
+    component_meta = {
+        "financial_health": ("💰 Financial Health", "Debt/Equity trend, interest coverage, current ratio"),
+        "profitability":    ("📈 Profitability",     "ROCE level, operating margin stability & trend"),
+        "cash_flow_quality":("💵 Cash Flow Quality", "CFO/PAT ratio, FCF conversion, positive FCF years"),
+        "growth_quality":   ("🚀 Growth Quality",    "Revenue CAGR consistency, EPS vs Revenue growth, PAT consistency"),
+    }
+
+    sub_detail_labels = {
+        # financial_health
+        "debt_equity":         "Debt/Equity score",
+        "interest_coverage":   "Interest coverage score",
+        "current_ratio":       "Current ratio score",
+        # profitability
+        "roce":                "ROCE score",
+        "margin_stability":    "Margin stability score",
+        "margin_trend":        "Margin trend score",
+        # cash_flow_quality
+        "cfo_pat_ratio":       "CFO/PAT ratio score",
+        "fcf_conversion":      "FCF/EBITDA conversion score",
+        "positive_fcf_years":  "Positive FCF years score",
+        # growth_quality
+        "revenue_growth":      "Revenue growth score",
+        "margin_on_growth":    "EPS vs Revenue CAGR score",
+        "pat_consistency":     "PAT CAGR consistency score",
+    }
+
+    comp_items = list(component_meta.items())
+    for i, (comp_key, (comp_label, comp_desc)) in enumerate(comp_items):
+        target_col = q_col1 if i % 2 == 0 else q_col2
+        with target_col:
+            comp_data  = qc.get(comp_key, {})
+            comp_score = comp_data.get("score", 0.0)
+            comp_max   = comp_data.get("max",   30)
+            comp_detail= comp_data.get("detail", {})
+
+            sub_rows = "".join(
+                f'<div style="display:flex;justify-content:space-between;'
+                f'font-size:11px;color:#8B9AB5;padding:2px 0;">'
+                f'<span>{sub_detail_labels.get(k, k)}</span>'
+                f'<span style="color:#7EB8F7;font-weight:600;">{v:.1f}</span>'
+                f'</div>'
+                for k, v in comp_detail.items()
+            )
+
+            pct   = int(comp_score / comp_max * 100) if comp_max > 0 else 0
+            color = "#27AE60" if pct >= 66 else ("#F39C12" if pct >= 33 else "#E74C3C")
+            st.markdown(
+                f'<div class="card" style="padding:14px 16px;">'
+                f'<div style="font-size:13px;font-weight:700;color:#E2E8F0;margin-bottom:4px;">{comp_label}</div>'
+                f'<div style="font-size:11px;color:#8B9AB5;margin-bottom:8px;">{comp_desc}</div>'
+                f'<div style="display:flex;justify-content:space-between;font-size:12px;color:#B0BCC8;">'
+                f'<span>Score</span><span style="color:{color};font-weight:700;">{comp_score:.1f} / {comp_max}</span></div>'
+                f'<div class="quality-bar-bg">'
+                f'<div style="height:14px;width:{pct}%;background:{color};border-radius:8px;"></div>'
+                f'</div>'
+                f'<div style="margin-top:8px;">{sub_rows}</div>'
+                f'</div>',
+                unsafe_allow_html=True,
+            )
+
+    # MOS requirement explanation
+    sec("Margin of Safety Requirements")
+    mos_req_dcf = dcf_result.get("mos_required", 20.0) if dcf_result else 20.0
+    st.markdown(
+        f'<div class="card" style="font-size:12px;color:#B0BCC8;line-height:2.0;">'
+        f'<div style="font-size:13px;font-weight:700;color:#E2E8F0;margin-bottom:10px;">'
+        f'🎯 MOS Required for {ticker}: <span style="color:{qs_color};">{mos_req_dcf:.0f}%</span></div>'
+        f'<div>Quality ≥ 80 &nbsp;→&nbsp; <strong style="color:#7EB8F7;">25%+</strong> upside required for BUY</div>'
+        f'<div>Quality 60–80 &nbsp;→&nbsp; <strong style="color:#7EB8F7;">20%+</strong> upside required</div>'
+        f'<div>Quality 40–60 &nbsp;→&nbsp; <strong style="color:#7EB8F7;">15%+</strong> upside required</div>'
+        f'<div>Quality &lt; 40 &nbsp;→&nbsp; <strong style="color:#E74C3C;">No BUY signal</strong> regardless of upside</div>'
+        f'<div style="margin-top:8px;color:#8B9AB5;">'
+        f'Business type premium: Cyclical +3% | Commodity +5%</div>'
+        f'</div>',
+        unsafe_allow_html=True,
+    )
+
+# ── TAB 6: DUPONT ──
 with tab_dupont:
     sec("DuPont ROE Decomposition (3-Step)")
     st.markdown(
@@ -764,7 +967,7 @@ with tab_dupont:
             f'</div></div>', unsafe_allow_html=True,
         )
 
-# ── TAB 6: PEERS ──
+# ── TAB 7: PEERS ──
 with tab_peers:
     sec("Peer Comparison")
     if peer_df is not None and len(peer_df) > 1:
@@ -787,26 +990,32 @@ with tab_peers:
     else:
         st.warning(f"No peers found for {ticker}.")
 
-# ── TAB 7: DCF VALUATION ──
+# ── TAB 8: DCF VALUATION ──
 with tab_dcf:
     if dcf_result is None:
         st.info("Enable 'Run DCF valuation' in the sidebar.")
     else:
         sec("Composite Valuation Signal")
-        signal     = dcf_result.get("signal","N/A")
-        conviction = dcf_result.get("conviction","")
-        comp_score = dcf_result.get("composite_score",0.0)
-        factor_sc  = dcf_result.get("factor_scores",{})
-        upside     = dcf_result.get("upside_pct")
-        base_iv    = dcf_result.get("base_iv")
-        bear_iv    = dcf_result["scenarios"]["Bear"]["intrinsic_per_share"]
-        bull_iv    = dcf_result["scenarios"]["Bull"]["intrinsic_per_share"]
-        wacc_used  = dcf_result["wacc_result"]["wacc"] * 100
-        auto_tag   = "🤖 History-derived" if final_assumptions.get("auto_derived") else "✏️ Manual override"
+        signal       = dcf_result.get("signal","N/A")
+        conviction   = dcf_result.get("conviction","")
+        comp_score   = dcf_result.get("composite_score",0.0)
+        factor_sc    = dcf_result.get("factor_scores",{})
+        upside       = dcf_result.get("upside_pct")
+        base_iv      = dcf_result.get("base_iv")
+        bear_iv      = dcf_result["scenarios"]["Bear"]["intrinsic_per_share"]
+        bull_iv      = dcf_result["scenarios"]["Bull"]["intrinsic_per_share"]
+        wacc_used    = dcf_result["wacc_result"]["wacc"] * 100
+        mos_req      = dcf_result.get("mos_required", 20.0)
+        quality_sc   = dcf_result.get("quality_score", 0.0)
+        biz_type_dcf = dcf_result.get("business_type", "stable")
+        sig_reason   = dcf_result.get("signal_reason", "")
+        dcf_wt       = dcf_result.get("assumptions_used", {}).get("quality_score", quality_sc)
+        auto_tag     = "🤖 History-derived" if final_assumptions.get("auto_derived") else "✏️ Manual override"
 
         sig_col, detail_col = st.columns([1,2])
         with sig_col:
-            sig_color = {"BUY":"#27AE60","SELL":"#E74C3C","HOLD":"#F39C12"}.get(signal,"#95A5A6")
+            sig_color = {"BUY":"#27AE60","STRONG BUY":"#1a7a3c","SELL":"#E74C3C","HOLD":"#F39C12"}.get(signal,"#95A5A6")
+            qs_color2 = "#27AE60" if quality_sc >= 70 else ("#F39C12" if quality_sc >= 45 else "#E74C3C")
             st.markdown(
                 f'<div class="card" style="text-align:center;border-color:{sig_color};padding:30px 20px;">'
                 f'<div style="font-size:11px;color:#8B9AB5;margin-bottom:8px;text-transform:uppercase;letter-spacing:1px;">Composite Signal</div>'
@@ -814,26 +1023,41 @@ with tab_dcf:
                 f'<div style="margin-top:14px;font-size:13px;color:#B0BCC8;">'
                 f'{conviction} conviction<br>'
                 f'<span style="color:{sig_color};font-weight:700;font-size:16px;">{comp_score:+.2f}</span> composite score</div>'
+                f'<div style="margin-top:10px;border-top:1px solid #1E2A45;padding-top:10px;">'
+                f'<div style="font-size:11px;color:#8B9AB5;">Business Quality</div>'
+                f'<div style="font-size:20px;font-weight:800;color:{qs_color2};">{quality_sc:.0f}/100</div>'
+                f'<div style="font-size:11px;color:#8B9AB5;">MOS Required: <span style="color:#7EB8F7;font-weight:600;">{mos_req:.0f}%</span></div>'
+                f'</div>'
                 f'<div style="margin-top:8px;font-size:10px;color:#8B9AB5;">{auto_tag}</div>'
                 f'</div>', unsafe_allow_html=True,
             )
+
         with detail_col:
             dcf_s   = factor_sc.get("dcf",      {}).get("score",0.0)
             pe_s    = factor_sc.get("pe",        {}).get("score",0.0)
             ev_s    = factor_sc.get("ev_ebitda", {}).get("score",0.0)
             pe_data = factor_sc.get("pe",{})
             ev_data = factor_sc.get("ev_ebitda",{})
-            dcf_detail = (f"Base IV ₹{fmt(base_iv,dec=0)} | CMP ₹{fmt(data.get('current_price'),dec=0)} | Upside {fmt(upside,'%')}")
+
+            # Dynamic weights from DCF result
+            q = quality_sc
+            w_dcf_pct = 65 if q >= 70 else 50 if q >= 50 else 40
+            w_pe_pct  = 20 if q >= 70 else 25 if q >= 50 else 30
+            w_ev_pct  = 15 if q >= 70 else 25 if q >= 50 else 30
+
+            dcf_detail = (f"Base IV ₹{fmt(base_iv,dec=0)} | CMP ₹{fmt(data.get('current_price'),dec=0)} | Upside {fmt(upside,'%')} (MOS reqd {mos_req:.0f}%)")
             pe_detail  = (f"Current P/E {pe_data['current_pe']:.1f}x | Fair P/E {pe_data['fair_pe']:.1f}x | EPS CAGR {fmt(r.get('eps_cagr_3y'),'%')}"
                           if "current_pe" in pe_data else pe_data.get("note","Insufficient data"))
             ev_detail  = (f"Current EV/EBITDA {fmt(ev_data.get('current_ev_ebitda'),'x')} | Normalised {fmt(ev_data.get('hist_ev_ebitda_norm'),'x')}"
                           if "current_ev_ebitda" in ev_data else ev_data.get("note","Insufficient data"))
             st.markdown(
                 f'<div class="card">'
-                f'<div style="font-size:13px;font-weight:700;color:#E2E8F0;margin-bottom:14px;">Factor Score Breakdown</div>'
-                + score_bar_html(dcf_s,"📐 DCF Intrinsic Value vs CMP",50)
-                + score_bar_html(pe_s, "📊 P/E Mean Reversion (PEG anchor)",25)
-                + score_bar_html(ev_s, "🏭 EV/EBITDA vs Historical Norm",25)
+                f'<div style="font-size:13px;font-weight:700;color:#E2E8F0;margin-bottom:14px;">'
+                f'Factor Score Breakdown '
+                f'<span style="font-size:10px;color:#8B9AB5;">(Quality {quality_sc:.0f}/100 → dynamic weights)</span></div>'
+                + score_bar_html(dcf_s, f"📐 DCF Intrinsic Value vs CMP", w_dcf_pct)
+                + score_bar_html(pe_s,  f"📊 P/E Mean Reversion (PEG anchor)", w_pe_pct)
+                + score_bar_html(ev_s,  f"🏭 EV/EBITDA vs Historical Norm", w_ev_pct)
                 + f'<div style="margin-top:12px;font-size:11px;color:#8B9AB5;line-height:1.9;">'
                 f'<strong style="color:#B0BCC8;">DCF:</strong> {dcf_detail}<br>'
                 f'<strong style="color:#B0BCC8;">P/E:</strong> {pe_detail}<br>'
@@ -841,22 +1065,46 @@ with tab_dcf:
                 f'</div></div>', unsafe_allow_html=True,
             )
 
+        # Signal reason card
+        if sig_reason:
+            st.markdown(
+                f'<div class="card" style="border-color:#1B4F8A44;">'
+                f'<div style="font-size:12px;font-weight:700;color:#7EB8F7;margin-bottom:6px;">📋 Signal Rationale</div>'
+                f'<div style="font-size:12px;color:#B0BCC8;line-height:1.8;">{sig_reason}</div>'
+                f'</div>',
+                unsafe_allow_html=True,
+            )
+
         st.markdown("<br>", unsafe_allow_html=True)
+
+        # How assumptions were derived
         if final_assumptions.get("auto_derived"):
-            aa_d  = final_assumptions
-            raw_g = aa_d.get("raw_growth_pct", aa_d["base_growth"]*100)
-            de_r  = aa_d.get("de_ratio",0)
+            aa_d       = final_assumptions
+            raw_g      = aa_d.get("raw_growth_pct", aa_d["base_growth"]*100)
+            de_r       = aa_d.get("de_ratio",0)
+            biz_t      = aa_d.get("business_type","stable")
+            biz_lbl2, biz_c2 = BIZ_TYPE_LABELS.get(biz_t, ("Stable","#4A90D9"))
+            peer_mg    = aa_d.get("peer_median_margin")
+            peer_mg_str = f" + peer median {peer_mg:.1f}%" if peer_mg else ""
             st.markdown(
                 f'<div class="card" style="border-color:#1B4F8A;">'
                 f'<div style="font-size:12px;font-weight:700;color:#7EB8F7;margin-bottom:10px;">'
-                f'🤖 How assumptions were derived from {ticker} historical data</div>'
+                f'🤖 How assumptions were derived for {ticker} '
+                f'<span style="color:{biz_c2};">({biz_lbl2})</span></div>'
                 f'<div style="font-size:11px;color:#B0BCC8;line-height:1.9;">'
                 f'• <b>Revenue growth {aa_d["base_growth"]*100:.1f}%</b>: '
-                f'3Y CAGR ({fmt(r.get("revenue_cagr_3y"),"%")}) ×60% + 5Y CAGR ({fmt(r.get("revenue_cagr_5y"),"%")}) ×40%, mean-reverted 30% toward 10% → raw {raw_g:.1f}%<br>'
-                f'• <b>EBITDA margin {aa_d["base_ebitda_margin"]:.1f}%</b>: median of 5-year operating margins<br>'
-                f'• <b>WACC {aa_d["base_wacc"]*100:.1f}%</b>: Hamada β={aa_d["beta"]:.2f} from D/E={de_r:.2f}x | cost of debt from interest/debt ratio<br>'
+                f'3Y CAGR ({fmt(r.get("revenue_cagr_3y"),"%")}) ×60% + 5Y CAGR ({fmt(r.get("revenue_cagr_5y"),"%")}) ×40% '
+                f'→ raw {raw_g:.1f}%, mean-reverted {int(aa_d.get("mr_weight",0.30)*100) if "mr_weight" in aa_d else "30"}% '
+                f'toward {biz_t} long-run anchor, capped at {("30%" if biz_t=="high-margin-stable" else "25%" if biz_t=="stable" else "20%" if biz_t=="cyclical" else "18%")}<br>'
+                f'• <b>EBITDA margin {aa_d["base_ebitda_margin"]:.1f}%</b>: '
+                f'5Y historical median{peer_mg_str} | ceiling {("60%" if biz_t=="high-margin-stable" else "45%" if biz_t=="stable" else "35%" if biz_t=="cyclical" else "20%")} for {biz_t}<br>'
+                f'• <b>WACC {aa_d["base_wacc"]*100:.1f}%</b>: '
+                f'Hamada β={aa_d["beta"]:.2f} (unlevered prior {("0.70" if biz_t=="high-margin-stable" else "0.80" if biz_t=="stable" else "1.00" if biz_t=="cyclical" else "1.10")}) '
+                f'from D/E={de_r:.2f}x | cost of debt includes credit quality floor<br>'
+                f'• <b>Effective tax rate {aa_d["tax_rate"]*100:.1f}%</b>: derived from tax expense / PBT (or 25% default)<br>'
                 f'• <b>Capex {aa_d["capex_pct"]*100:.1f}%</b>: median of historical capex/revenue<br>'
-                f'• <b>Terminal growth {aa_d["base_tgr"]*100:.1f}%</b>: ½×base, bounded [3%,6%]'
+                f'• <b>Terminal growth {aa_d["base_tgr"]*100:.1f}%</b>: '
+                f'max(GDP/2=3.5%, {biz_t} floor {("4%" if biz_t=="high-margin-stable" else "3%")}), bounded [3%,6%], sanity-checked vs WACC'
                 f'</div></div>', unsafe_allow_html=True,
             )
 
@@ -901,7 +1149,7 @@ with tab_dcf:
             st.dataframe(sens_df.set_index("Variable")[["Low IV","Base IV","High IV","Impact"]],
                          use_container_width=True)
 
-# ── TAB 8: MONTE CARLO ──
+# ── TAB 9: MONTE CARLO ──
 with tab_mc:
     if mc_result is None:
         st.info("Enable 'Run Monte Carlo' in the sidebar.")
