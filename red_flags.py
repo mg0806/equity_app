@@ -60,14 +60,22 @@ def detect_red_flags(r: dict) -> list:
     debt_rising  = len(debt3) >= 2 and not np.isnan(debt3[0]) and debt3[-1] > debt3[0]
     roce_falling = len(roce3) >= 2 and not np.isnan(roce3[0]) and roce3[-1] < roce3[0]
     triggered_2  = debt_rising and roce_falling
+    
+    # Calculate debt growth safely (avoid division by zero)
+    if not np.isnan(debt3[0]) and not np.isnan(roce3[0]) and debt3[0] != 0:
+        debt_growth = ((debt3[-1] - debt3[0]) / abs(debt3[0]) * 100)
+        detail_str = (f"Debt grew {debt_growth:.0f}% while ROCE fell from {roce3[0]:.1f}% to {roce3[-1]:.1f}%")
+    elif not np.isnan(debt3[0]) and not np.isnan(roce3[0]) and debt3[0] == 0 and debt3[-1] > 0:
+        detail_str = (f"Debt increased from 0 to {debt3[-1]:.0f} while ROCE fell from {roce3[0]:.1f}% to {roce3[-1]:.1f}%")
+    else:
+        detail_str = "Insufficient data"
+    
     flags.append({
         "name": "Capital Allocation",
         "check": "Rising debt with falling ROCE",
         "triggered": triggered_2,
         "severity": "high" if triggered_2 else "ok",
-        "detail": (f"Debt grew {((debt3[-1]-debt3[0])/abs(debt3[0])*100):.0f}% while "
-                   f"ROCE fell from {roce3[0]:.1f}% to {roce3[-1]:.1f}%")
-                  if (not np.isnan(debt3[0]) and not np.isnan(roce3[0])) else "Insufficient data",
+        "detail": detail_str,
         "description": "Borrowing more while generating lower returns on capital suggests inefficient "
                        "capital deployment or deteriorating business quality.",
     })

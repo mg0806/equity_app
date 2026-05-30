@@ -7,6 +7,7 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import time
+from datetime import datetime
 
 st.set_page_config(
     page_title="EquityLens — NSE Research",
@@ -48,17 +49,29 @@ section[data-testid="stSidebar"] { background-color: #0D1424; border-right: 1px 
 </style>
 """, unsafe_allow_html=True)
 
-from scraper import fetch_screener_data, fetch_peer_data
+from scraper import is_index_or_benchmark, fallback_peers_for
+from data_sources import fetch_company_data, fetch_peer_data_multi_source
 from ratios import calculate_ratios, build_peer_comparison, last_valid
 from red_flags import detect_red_flags, flags_summary
 from dcf import (run_three_scenarios, run_monte_carlo, run_sensitivity,
-                 derive_assumptions_from_history)
+                 derive_assumptions_from_screener, derive_assumptions_from_history)
 from report_pdf import generate_pdf
 from excel_export import export_excel
 from charts import (chart_financial_trend, chart_cashflow_trend, chart_margins,
                     chart_dupont, chart_balance_sheet, chart_dcf_waterfall,
                     chart_scenario_comparison, chart_monte_carlo, chart_tornado,
                     chart_peer_radar)
+from market_ready import build_market_ready_report
+from snapshot_store import (
+    DEFAULT_DB_PATH,
+    DEFAULT_MODEL_VERSION,
+    DEFAULT_SOURCE_VERSION,
+    SnapshotStore,
+)
+
+
+MODEL_VERSION = DEFAULT_MODEL_VERSION
+SOURCE_VERSION = DEFAULT_SOURCE_VERSION
 
 
 # ── Helpers ──
@@ -76,6 +89,117 @@ def chart_hint():
         'Pan &amp; Zoom to explore</em></div>',
         unsafe_allow_html=True,
     )
+
+
+def _open_store():
+    return SnapshotStore(DEFAULT_DB_PATH)
+
+
+def _snapshot_to_report_data(snapshot: dict) -> dict:
+    ticker = snapshot["ticker"]
+    data = snapshot["data"]
+    r = snapshot.get("ratios") or calculate_ratios(data)
+    peer_df = snapshot.get("peer_df")
+    if peer_df is None or not hasattr(peer_df, "empty"):
+        peer_df = pd.DataFrame()
+    assumptions = snapshot.get("assumptions") or {}
+    dcf_result = snapshot.get("dcf_result") or {}
+    market_ready = snapshot.get("market_ready") or {}
+    flags = detect_red_flags(r)
+    flag_summ = flags_summary(flags)
+    sens_df = None
+    if dcf_result and not dcf_result.get("error"):
+        try:
+            sens_df = run_sensitivity(data, r, assumptions)
+        except Exception:
+            sens_df = None
+    pdf_bytes = generate_pdf(ticker, data, r, flags, peer_df, dcf_result, market_ready)
+    excel_bytes = export_excel(ticker, data, r, flags, peer_df, dcf_result, market_ready)
+    return {
+        "ticker": ticker,
+        "data": data,
+        "r": r,
+        "flags": flags,
+        "flag_summ": flag_summ,
+        "peer_df": peer_df,
+        "dcf_result": dcf_result,
+        "mc_result": None,
+        "sens_df": sens_df,
+        "market_ready": market_ready,
+        "pdf_bytes": pdf_bytes,
+        "excel_bytes": excel_bytes,
+        "final_assumptions": assumptions,
+        "years": r.get("years", []),
+        "snapshot_meta": {
+            "snapshot_date": snapshot.get("snapshot_date"),
+            "created_at": snapshot.get("created_at"),
+            "model_version": snapshot.get("model_version", MODEL_VERSION),
+            "source_version": snapshot.get("source_version", SOURCE_VERSION),
+        },
+    }
+
+
+def _history_frame(limit: int = 30) -> pd.DataFrame:
+    store = _open_store()
+    try:
+        snapshots = store.snapshots()
+    finally:
+        store.close()
+    rows = []
+    for snap in snapshots[-limit:]:
+        target = (snap.get("market_ready") or {}).get("target", {})
+        confidence = (snap.get("market_ready") or {}).get("confidence", {})
+        risk = (snap.get("market_ready") or {}).get("risk", {})
+        dq = (snap.get("market_ready") or {}).get("data_quality", {})
+        dcf = snap.get("dcf_result") or {}
+        rows.append({
+            "Key": f"{snap['ticker']} | {snap['snapshot_date']} | {snap['created_at']}",
+            "Ticker": snap["ticker"],
+            "Company": snap.get("company_name"),
+            "Snapshot Date": snap.get("snapshot_date"),
+            "Signal": dcf.get("signal", "N/A"),
+            "Target": target.get("target_price"),
+            "Confidence": confidence.get("score"),
+            "Risk": risk.get("score"),
+            "Data Quality": dq.get("score"),
+            "Model Version": snap.get("model_version", MODEL_VERSION),
+            "Created At": snap.get("created_at"),
+        })
+    df = pd.DataFrame(rows)
+    return df.sort_values("Created At", ascending=False) if not df.empty else df
+
+
+def _load_snapshot_by_key(key: str) -> dict | None:
+    store = _open_store()
+    try:
+        for snap in store.snapshots():
+            snap_key = f"{snap['ticker']} | {snap['snapshot_date']} | {snap['created_at']}"
+            if snap_key == key:
+                return snap
+    finally:
+        store.close()
+    return None
+
+
+def _save_report_snapshot(ticker, data, r, peer_df, assumptions, dcf_result, market_ready):
+    snapshot_ts = datetime.utcnow().isoformat(timespec="seconds")
+    store = _open_store()
+    try:
+        store.save_snapshot(
+            ticker,
+            data,
+            ratios=r,
+            peer_df=peer_df,
+            assumptions=assumptions,
+            dcf_result=dcf_result,
+            market_ready=market_ready,
+            snapshot_date=snapshot_ts,
+            source_version=SOURCE_VERSION,
+            model_version=MODEL_VERSION,
+        )
+    finally:
+        store.close()
+    return snapshot_ts
 
 def plotly(fig):
     st.plotly_chart(fig, use_container_width=True)
@@ -112,12 +236,14 @@ def quality_bar_html(score: float, max_score: float, label: str) -> str:
     )
 
 BIZ_TYPE_LABELS = {
+    "exchange-platform":   ("Exchange Platform",       "#8B5CF6"),
     "high-margin-stable": ("🏆 High-Margin Stable",  "#27AE60"),
     "stable":             ("✅ Stable",               "#4A90D9"),
     "cyclical":           ("🔄 Cyclical",             "#F39C12"),
     "commodity":          ("🪨 Commodity",            "#E74C3C"),
 }
 BIZ_TYPE_TOOLTIPS = {
+    "exchange-platform":   "Exchange / capital-market infrastructure: use forward EPS multiple valuation plus DCF.",
     "high-margin-stable": "High OPM (≥18%), low revenue volatility, consistent FCF — e.g. IT, pharma, FMCG.",
     "stable":             "Moderate-to-good margins, predictable demand — e.g. consumer, banks.",
     "cyclical":           "Revenue highly sensitive to economic cycles — e.g. auto, infra, metals.",
@@ -165,6 +291,7 @@ _DEFAULT_AA = {
     "last_ticker":           "",
     # full report cache
     "report_data":           None,
+    "loaded_snapshot_key":    "",
 }
 for k, v in _DEFAULT_AA.items():
     if k not in st.session_state:
@@ -236,6 +363,43 @@ with st.sidebar:
     n_peer_limit = st.slider("Max peers", 1, 5, 3)
 
     generate_btn = st.button("🚀 Generate Report", type="primary", use_container_width=True)
+
+    st.divider()
+
+    with st.expander("Report History", expanded=False):
+        hist_df = _history_frame()
+        if hist_df.empty:
+            st.caption("No saved reports yet. Generate a report to create the first snapshot.")
+        else:
+            st.dataframe(
+                hist_df.drop(columns=["Key"]).head(12),
+                use_container_width=True,
+                height=220,
+                hide_index=True,
+            )
+            selected_key = st.selectbox(
+                "Load saved report",
+                hist_df["Key"].tolist(),
+                format_func=lambda k: k.split(" | ")[0] + " - " + k.split(" | ")[1],
+            )
+            if st.button("Load Selected Report", use_container_width=True):
+                snap = _load_snapshot_by_key(selected_key)
+                if snap:
+                    loaded_report = _snapshot_to_report_data(snap)
+                    st.session_state["report_data"] = loaded_report
+                    st.session_state["last_ticker"] = snap["ticker"]
+                    st.session_state["loaded_snapshot_key"] = selected_key
+                    _write_aa(loaded_report.get("final_assumptions") or {})
+                    st.session_state["aa_ticker"] = snap["ticker"]
+                    st.session_state["aa_is_derived"] = True
+                    st.session_state["cagr3"] = loaded_report["r"].get("revenue_cagr_3y")
+                    st.session_state["cagr5"] = loaded_report["r"].get("revenue_cagr_5y")
+                    dcf_loaded = loaded_report.get("dcf_result") or {}
+                    st.session_state["sig_signal"] = dcf_loaded.get("signal", "")
+                    st.session_state["sig_conviction"] = dcf_loaded.get("conviction", "")
+                    st.session_state["sig_composite_score"] = dcf_loaded.get("composite_score", 0.0)
+                    st.session_state["sig_mos_required"] = dcf_loaded.get("mos_required", 20.0)
+                    st.rerun()
 
     st.divider()
 
@@ -449,21 +613,32 @@ if generate_btn and ticker_input:
                       unsafe_allow_html=True)
 
     try:
-        upd(10, f"Fetching {ticker} from Screener.in...")
-        data = fetch_screener_data(ticker)
+        upd(10, f"Fetching {ticker} from Screener.in + Yahoo Finance + NSE/BSE events...")
+        data = fetch_company_data(ticker, include_market=True)
 
         upd(25, "Calculating ratios...")
         r = calculate_ratios(data)
 
         # Fetch peers first so peer_df is available for margin benchmarking
         peer_data_list, peer_df = [], None
+        if fetch_peers:
+            valid_peers = [
+                p for p in (data.get("peers") or [])
+                if not is_index_or_benchmark(p) and p != ticker
+            ]
+            if not valid_peers:
+                valid_peers = fallback_peers_for(data)
+                data["peers"] = valid_peers
+
         if fetch_peers and data.get("peers"):
-            upd(35, f"Fetching peers: {', '.join(data['peers'][:n_peer_limit])}...")
-            peer_data_list = fetch_peer_data(data["peers"][:n_peer_limit], delay=1.0)
+            peers_to_fetch = data["peers"][:n_peer_limit]
+            upd(35, f"Fetching peers: {', '.join(peers_to_fetch)}...")
+            peer_data_list = fetch_peer_data_multi_source(peers_to_fetch, delay=1.0, include_market=False)
             peer_df = build_peer_comparison(ticker, data, r, peer_data_list)
 
-        upd(45, "Deriving DCF assumptions from historical data...")
-        auto_assum = derive_assumptions_from_history(data, r, peer_df)
+        upd(45, "Deriving DCF assumptions from Screener.in data...")
+        # Use Screener-aligned assumptions (primary) with fallback to historical
+        auto_assum = derive_assumptions_from_screener(data, r, peer_df)
 
         # Write derived assumptions into session state
         _write_aa(auto_assum)
@@ -497,15 +672,56 @@ if generate_btn and ticker_input:
         if run_mc_opt and run_dcf_opt:
             upd(77, "Monte Carlo simulation (10,000 runs)...")
             mc_result = run_monte_carlo(data, r, final_assumptions)
+            if dcf_result and mc_result and not mc_result.get("error"):
+                mc_signal = mc_result.get("mc_signal")
+                prob = mc_result.get("prob_undervalued")
+                dcf_result["mc_signal"] = mc_signal
+                dcf_result["mc_prob_undervalued"] = prob
+                dcf_result["mc_median_upside_pct"] = mc_result.get("median_upside_pct")
+                platform_mode = bool(dcf_result.get("platform_valuation"))
+
+                # Use Monte Carlo as a risk gate on the headline call.
+                if (not platform_mode and dcf_result.get("signal") in ("BUY", "STRONG BUY")
+                        and prob is not None and prob < 45):
+                    dcf_result["signal"] = "HOLD"
+                    dcf_result["conviction"] = "Moderate"
+                    dcf_result["signal_reason"] += (
+                        f" Monte Carlo validation is weaker ({prob:.1f}% probability of undervaluation), "
+                        "so the headline signal is risk-adjusted to HOLD."
+                    )
+                elif not platform_mode and dcf_result.get("signal") == "SELL" and prob is not None and prob > 60:
+                    dcf_result["signal"] = "HOLD"
+                    dcf_result["conviction"] = "Moderate"
+                    dcf_result["signal_reason"] += (
+                        f" Monte Carlo distribution is mixed ({prob:.1f}% probability of undervaluation), "
+                        "so the headline signal is risk-adjusted to HOLD."
+                    )
+
+                st.session_state["sig_signal"] = dcf_result.get("signal", "")
+                st.session_state["sig_conviction"] = dcf_result.get("conviction", "")
 
         sens_df = None
         if run_dcf_opt:
             upd(85, "Sensitivity analysis...")
             sens_df = run_sensitivity(data, r, final_assumptions)
 
+        upd(90, "Building market-ready decision layer...")
+        market_ready = build_market_ready_report(
+            data=data,
+            r=r,
+            flags=flags,
+            peer_df=peer_df,
+            dcf_result=dcf_result,
+            mc_result=mc_result,
+            assumptions=final_assumptions,
+        )
+
         upd(93, "Generating PDF & Excel...")
-        pdf_bytes   = generate_pdf(ticker, data, r, flags, peer_df, dcf_result)
-        excel_bytes = export_excel(ticker, data, r, flags, peer_df, dcf_result)
+        pdf_bytes   = generate_pdf(ticker, data, r, flags, peer_df, dcf_result, market_ready)
+        excel_bytes = export_excel(ticker, data, r, flags, peer_df, dcf_result, market_ready)
+
+        upd(96, "Saving model-versioned report snapshot...")
+        snapshot_ts = _save_report_snapshot(ticker, data, r, peer_df, final_assumptions, dcf_result, market_ready)
 
         # Store entire report in session state
         st.session_state["report_data"] = {
@@ -513,9 +729,15 @@ if generate_btn and ticker_input:
             "flags": flags, "flag_summ": flag_summ,
             "peer_df": peer_df, "dcf_result": dcf_result,
             "mc_result": mc_result, "sens_df": sens_df,
+            "market_ready": market_ready,
             "pdf_bytes": pdf_bytes, "excel_bytes": excel_bytes,
             "final_assumptions": final_assumptions,
             "years": r.get("years", []),
+            "snapshot_meta": {
+                "snapshot_date": snapshot_ts,
+                "model_version": MODEL_VERSION,
+                "source_version": SOURCE_VERSION,
+            },
         }
 
         upd(100, "Done!")
@@ -550,10 +772,12 @@ peer_df           = rd["peer_df"]
 dcf_result        = rd["dcf_result"]
 mc_result         = rd["mc_result"]
 sens_df           = rd["sens_df"]
+market_ready      = rd.get("market_ready", {})
 pdf_bytes         = rd["pdf_bytes"]
 excel_bytes       = rd["excel_bytes"]
 final_assumptions = rd["final_assumptions"]
 years             = rd["years"]
+snapshot_meta     = rd.get("snapshot_meta", {})
 
 
 # ── COMPANY HEADER ──
@@ -593,6 +817,14 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
+if snapshot_meta:
+    st.caption(
+        "Saved snapshot: "
+        f"{snapshot_meta.get('snapshot_date', 'today')} | "
+        f"Model: {snapshot_meta.get('model_version', MODEL_VERSION)} | "
+        f"Sources: {snapshot_meta.get('source_version', SOURCE_VERSION)}"
+    )
+
 m1,m2,m3,m4,m5,m6,m7 = st.columns(7)
 for col, label, val in [
     (m1,"Mkt Cap",   fmt(mktcap, suffix=" Cr", prefix="₹", dec=0)),
@@ -605,6 +837,17 @@ for col, label, val in [
 ]:
     with col:
         st.metric(label, val)
+
+src_bits = []
+for label, key in [("Financials", "financials"), ("Price", "current_price"), ("History", "price_history")]:
+    source = (data.get("sources") or {}).get(key)
+    if source:
+        src_bits.append(f"{label}: {source}")
+if src_bits:
+    st.markdown(
+        f'<div style="font-size:11px;color:#8B9AB5;margin-top:-4px;">Data sources: {" | ".join(src_bits)}</div>',
+        unsafe_allow_html=True,
+    )
 
 st.markdown("<br>", unsafe_allow_html=True)
 dl1, dl2, dl3 = st.columns([2, 2, 3])
@@ -648,11 +891,238 @@ st.divider()
 # ══════════════════════════════════════════
 # TABS
 # ══════════════════════════════════════════
-(tab_fin, tab_rat, tab_cf, tab_flags, tab_quality,
+(tab_decision, tab_fin, tab_rat, tab_cf, tab_flags, tab_quality,
  tab_dupont, tab_peers, tab_dcf, tab_mc) = st.tabs([
-    "📈 Financials","🧮 Ratios","📊 Cash Flow","⚠️ Red Flags",
+    "Decision","📈 Financials","🧮 Ratios","📊 Cash Flow","⚠️ Red Flags",
     "🏅 Business Quality","🔄 DuPont","🏢 Peers","🎯 DCF Valuation","🎲 Monte Carlo",
 ])
+
+# ── TAB 0: MARKET-READY DECISION LAYER ──
+with tab_decision:
+    sec("Investment Decision Dashboard")
+    mr = market_ready or {}
+    target = mr.get("target", {})
+    risk = mr.get("risk", {})
+    conf = mr.get("confidence", {})
+    dq = mr.get("data_quality", {})
+    tech = mr.get("technical", {})
+    backtest = mr.get("backtest", {})
+    quarterly = mr.get("quarterly", {})
+    valuation_bands = mr.get("valuation_bands", {})
+    revision = mr.get("earnings_revision", {})
+    momentum = mr.get("momentum", {})
+    reliability = mr.get("source_reliability", {})
+    sector_val = mr.get("sector_valuation", {})
+    explain = mr.get("explainability", {})
+
+    d1, d2, d3, d4, d5 = st.columns(5)
+    with d1:
+        st.metric("Blended Target", fmt(target.get("target_price"), prefix="₹", dec=0))
+    with d2:
+        st.metric("Target Upside", fmt(target.get("upside_pct"), "%"))
+    with d3:
+        st.metric("Signal Confidence", f"{fmt(conf.get('score'), dec=0)} / 100", conf.get("rating", ""))
+    with d4:
+        st.metric("Risk Score", f"{fmt(risk.get('score'), dec=0)} / 100", risk.get("rating", ""))
+    with d5:
+        st.metric("Data Quality", f"{fmt(dq.get('score'), dec=0)} / 100", dq.get("rating", ""))
+
+    c_left, c_right = st.columns([1.25, 1])
+    with c_left:
+        signal_txt = dcf_result.get("signal", "N/A") if dcf_result else "N/A"
+        st.markdown(
+            f'<div class="card">'
+            f'<div style="font-size:13px;font-weight:700;color:#E2E8F0;margin-bottom:10px;">Target Price Bridge</div>'
+            f'<div style="font-size:12px;color:#B0BCC8;line-height:1.8;">'
+            f'Final signal: <strong style="color:#7EB8F7;">{signal_txt}</strong><br>'
+            f'Confidence: <strong>{conf.get("rating","N/A")}</strong> | Risk: <strong>{risk.get("rating","N/A")}</strong><br>'
+            f'Sector model: <strong>{sector_val.get("sector_model","N/A")}</strong>'
+            f' | Revision: <strong>{revision.get("rating","N/A")}</strong><br>'
+            f'Momentum: <strong>{momentum.get("rating", tech.get("rating","Unavailable"))}</strong>'
+            f' | Valuation band: <strong>{valuation_bands.get("rating","Unavailable")}</strong><br>'
+            f'Technical overlay: <strong>{tech.get("rating","Unavailable")}</strong> - {tech.get("note","")}'
+            f'<br>1Y return: <strong>{fmt(tech.get("return_1y_pct"), "%")}</strong>'
+            f' | Volatility: <strong>{fmt(tech.get("volatility_1y_pct"), "%")}</strong>'
+            f' | Beta vs Nifty: <strong>{fmt(tech.get("beta_vs_nifty"), "x", dec=2)}</strong>'
+            f'</div></div>',
+            unsafe_allow_html=True,
+        )
+        components = target.get("components")
+        if components is not None and not components.empty:
+            st.dataframe(
+                components[["Model", "Target", "Weight %", "Note"]].set_index("Model"),
+                use_container_width=True,
+            )
+        else:
+            st.info("Target price bridge is unavailable because valuation inputs are incomplete.")
+
+    with c_right:
+        reasons = risk.get("reasons", [])
+        warnings = dq.get("warnings", [])
+        notes = conf.get("notes", [])
+        st.markdown(
+            f'<div class="card">'
+            f'<div style="font-size:13px;font-weight:700;color:#E2E8F0;margin-bottom:10px;">Model Reliability</div>'
+            f'<div style="font-size:12px;color:#B0BCC8;line-height:1.8;">'
+            f'<strong>Risk drivers:</strong><br>{"<br>".join(reasons[:4]) if reasons else "No major risk drivers"}<br><br>'
+            f'<strong>Data checks:</strong><br>{"<br>".join(warnings[:4]) if warnings else "Core data is complete"}<br><br>'
+            f'<strong>Confidence notes:</strong><br>{"<br>".join(notes[:3]) if notes else "Neutral confidence inputs"}'
+            f'</div></div>',
+            unsafe_allow_html=True,
+        )
+
+    f1, f2 = st.columns([1, 1])
+    with f1:
+        sec("Forecast Financial Statements")
+        forecast = mr.get("forecast")
+        if forecast is not None and not forecast.empty:
+            st.dataframe(forecast.set_index("Year"), use_container_width=True)
+        else:
+            st.info("Forecast unavailable.")
+    with f2:
+        sec("Backtest Readiness")
+        proxy = backtest.get("fundamental_proxy", {})
+        st.markdown(
+            f'<div class="card">'
+            f'<div style="font-size:22px;font-weight:800;color:#7EB8F7;">{backtest.get("status","N/A")}</div>'
+            f'<div style="font-size:12px;color:#B0BCC8;margin-top:8px;">{backtest.get("note","")}</div>'
+            f'<div style="font-size:12px;color:#B0BCC8;margin-top:12px;">'
+            f'Fundamental proxy: <strong>{proxy.get("status","N/A")}</strong>'
+            f'{(" | Hit rate " + fmt(proxy.get("hit_rate"), "%") + " across " + str(proxy.get("observations", 0)) + " observations") if proxy.get("status") == "Computed" else ""}'
+            f'</div>'
+            f'<div style="font-size:11px;color:#8B9AB5;margin-top:12px;">'
+            f'Run a broad historical hit-rate study before presenting signal performance as audited evidence.'
+            f'</div></div>',
+            unsafe_allow_html=True,
+        )
+
+    x1, x2 = st.columns([1, 1])
+    with x1:
+        sec("Signal Explainability")
+        reasons = explain.get("top_reasons", [])
+        risks = explain.get("top_risks", [])
+        st.markdown(
+            f'<div class="card">'
+            f'<div style="font-size:13px;font-weight:700;color:#27AE60;margin-bottom:8px;">Top Reasons</div>'
+            f'<div style="font-size:12px;color:#B0BCC8;line-height:1.8;">{"<br>".join(reasons[:5]) if reasons else "No positive drivers available"}</div>'
+            f'<div style="font-size:13px;font-weight:700;color:#E74C3C;margin-top:14px;margin-bottom:8px;">Top Risks</div>'
+            f'<div style="font-size:12px;color:#B0BCC8;line-height:1.8;">{"<br>".join(risks[:5]) if risks else "No major risks available"}</div>'
+            f'</div>',
+            unsafe_allow_html=True,
+        )
+    with x2:
+        sec("Sector Model & Source Reliability")
+        st.markdown(
+            f'<div class="card" style="font-size:12px;color:#B0BCC8;line-height:1.8;">'
+            f'<strong style="color:#E2E8F0;">Sector model:</strong> {sector_val.get("sector_model","N/A")}<br>'
+            f'<strong style="color:#E2E8F0;">Sector target:</strong> {fmt(sector_val.get("target_price"), prefix="â‚¹", dec=0)} '
+            f'({fmt(sector_val.get("upside_pct"), "%")})<br>'
+            f'<strong style="color:#E2E8F0;">Reliability:</strong> {fmt(reliability.get("score"), dec=0)} / 100 ({reliability.get("rating","N/A")})<br>'
+            f'<br>{"<br>".join((sector_val.get("drivers") or [])[:3])}<br>'
+            f'{"<br>".join((reliability.get("notes") or [])[:5])}'
+            f'</div>',
+            unsafe_allow_html=True,
+        )
+
+    y1, y2 = st.columns([1, 1])
+    with y1:
+        sec("Quarterly & TTM Snapshot")
+        qtable = quarterly.get("table")
+        if qtable is not None and not qtable.empty:
+            st.caption(f"Quarterly trend: {quarterly.get('rating','N/A')}")
+            st.dataframe(qtable.set_index("Metric"), use_container_width=True, height=300)
+        else:
+            st.info(quarterly.get("note", "Quarterly snapshot unavailable."))
+    with y2:
+        sec("Valuation Bands")
+        vtable = valuation_bands.get("table")
+        if vtable is not None and not vtable.empty:
+            st.caption(f"Band status: {valuation_bands.get('rating','N/A')}")
+            st.dataframe(vtable.set_index("Metric"), use_container_width=True, height=300)
+        else:
+            st.info(valuation_bands.get("note", "Valuation band analysis unavailable."))
+
+    z1, z2 = st.columns([1, 1])
+    with z1:
+        sec("Earnings Revision & Momentum")
+        rev_rows = [{"Area": "Revision", "Metric": "Rating", "Value": revision.get("rating", "N/A")},
+                    {"Area": "Revision", "Metric": "Score", "Value": revision.get("score")}]
+        for d in revision.get("drivers", [])[:6]:
+            rev_rows.append({"Area": "Revision Driver", "Metric": "Driver", "Value": d})
+        mtable = momentum.get("table")
+        st.dataframe(pd.DataFrame(rev_rows), use_container_width=True, height=190)
+        if mtable is not None and not mtable.empty:
+            st.caption(f"Momentum overlay: {momentum.get('rating','N/A')}")
+            st.dataframe(mtable.set_index("Metric"), use_container_width=True, height=260)
+    with z2:
+        sec("Historical Signal Validation")
+        validation = backtest.get("historical_validation", {}) or backtest.get("price_proxy", {})
+        summary = validation.get("summary")
+        headline = validation.get("headline")
+        if headline:
+            st.markdown(
+                f'<div class="card" style="font-size:13px;color:#B0BCC8;line-height:1.8;">'
+                f'<strong style="color:#7EB8F7;">{headline}</strong><br>'
+                f'Evidence quality: <strong>{validation.get("evidence_quality","N/A")}</strong> '
+                f'| Observations: <strong>{validation.get("observations","N/A")}</strong>'
+                f'</div>',
+                unsafe_allow_html=True,
+            )
+        st.caption(validation.get("note", "Historical validation unavailable."))
+        if summary is not None and not summary.empty:
+            st.dataframe(summary.set_index("Signal"), use_container_width=True, height=180)
+            trades = validation.get("trades")
+            if trades is not None and not trades.empty:
+                with st.expander("Rolling validation observations"):
+                    st.dataframe(trades.tail(25), use_container_width=True)
+            by_regime = validation.get("by_regime")
+            if by_regime is not None and not by_regime.empty:
+                with st.expander("Breakdown by market regime"):
+                    st.dataframe(by_regime, use_container_width=True)
+        else:
+            st.info(validation.get("status", "Unavailable"))
+
+    with st.expander("Data Source Audit"):
+        source_rows = []
+        source_rows.append({"Field": "model_version", "Source": snapshot_meta.get("model_version", MODEL_VERSION)})
+        source_rows.append({"Field": "source_version", "Source": snapshot_meta.get("source_version", SOURCE_VERSION)})
+        if snapshot_meta.get("created_at"):
+            source_rows.append({"Field": "saved_snapshot_created_at", "Source": snapshot_meta.get("created_at")})
+        for key, source in (data.get("sources") or {}).items():
+            source_rows.append({"Field": key, "Source": source})
+        for source, status in (data.get("source_status") or {}).items():
+            source_rows.append({"Field": f"{source} status", "Source": status})
+        if source_rows:
+            st.dataframe(pd.DataFrame(source_rows), use_container_width=True)
+        notes = data.get("data_quality_notes") or []
+        if notes:
+            st.warning(" | ".join(notes))
+        elif source_rows:
+            st.caption("No major source conflicts detected.")
+        else:
+            st.info("Source metadata is unavailable for this cached report. Regenerate the report.")
+
+    exchange_events = data.get("exchange_events") or {}
+    actions = exchange_events.get("corporate_actions")
+    announcements = exchange_events.get("announcements")
+    if (
+        actions is not None and hasattr(actions, "empty") and not actions.empty
+    ) or (
+        announcements is not None and hasattr(announcements, "empty") and not announcements.empty
+    ):
+        with st.expander("NSE/BSE Corporate Actions & Announcements"):
+            if actions is not None and hasattr(actions, "empty") and not actions.empty:
+                st.markdown("**Corporate actions**")
+                st.dataframe(actions, use_container_width=True, height=220)
+            if announcements is not None and hasattr(announcements, "empty") and not announcements.empty:
+                st.markdown("**Corporate announcements**")
+                st.dataframe(announcements, use_container_width=True, height=260)
+
+    ranked = mr.get("peer_ranking")
+    if ranked is not None and not ranked.empty:
+        sec("Peer Quality Ranking")
+        rank_cols = [c for c in ["Company", "Ticker", "Peer Score", "ROE %", "ROCE %", "Revenue CAGR 3Y %", "P/E", "D/E"] if c in ranked.columns]
+        st.dataframe(ranked[rank_cols].set_index("Company"), use_container_width=True, height=260)
 
 # ── TAB 1: FINANCIALS ──
 with tab_fin:
@@ -971,6 +1441,13 @@ with tab_dupont:
 with tab_peers:
     sec("Peer Comparison")
     if peer_df is not None and len(peer_df) > 1:
+        peer_df = peer_df[
+            peer_df.apply(
+                lambda row: row.get("_is_target") is not False
+                or not is_index_or_benchmark(row.get("Ticker"), row.get("Company")),
+                axis=1,
+            )
+        ].copy()
         display_cols = [c for c in ["Company","Ticker","Mkt Cap (Cr)","CMP (₹)","P/E","P/B",
                                      "Net Margin %","ROE %","ROCE %","D/E","Current Ratio","Revenue CAGR 3Y %"]
                         if c in peer_df.columns]
@@ -1036,25 +1513,36 @@ with tab_dcf:
             dcf_s   = factor_sc.get("dcf",      {}).get("score",0.0)
             pe_s    = factor_sc.get("pe",        {}).get("score",0.0)
             ev_s    = factor_sc.get("ev_ebitda", {}).get("score",0.0)
+            pf_s    = factor_sc.get("platform_eps", {}).get("score",0.0)
             pe_data = factor_sc.get("pe",{})
             ev_data = factor_sc.get("ev_ebitda",{})
+            pf_data = factor_sc.get("platform_eps",{})
 
             # Dynamic weights from DCF result
             q = quality_sc
-            w_dcf_pct = 65 if q >= 70 else 50 if q >= 50 else 40
-            w_pe_pct  = 20 if q >= 70 else 25 if q >= 50 else 30
-            w_ev_pct  = 15 if q >= 70 else 25 if q >= 50 else 30
+            w_platform_pct = int(round(dcf_result.get("platform_weight", 0.0) * 100))
+            if w_platform_pct:
+                w_dcf_pct, w_pe_pct, w_ev_pct = 20, 15, 10
+            else:
+                w_dcf_pct = 65 if q >= 70 else 50 if q >= 50 else 40
+                w_pe_pct  = 20 if q >= 70 else 25 if q >= 50 else 30
+                w_ev_pct  = 15 if q >= 70 else 25 if q >= 50 else 30
 
             dcf_detail = (f"Base IV ₹{fmt(base_iv,dec=0)} | CMP ₹{fmt(data.get('current_price'),dec=0)} | Upside {fmt(upside,'%')} (MOS reqd {mos_req:.0f}%)")
             pe_detail  = (f"Current P/E {pe_data['current_pe']:.1f}x | Fair P/E {pe_data['fair_pe']:.1f}x | EPS CAGR {fmt(r.get('eps_cagr_3y'),'%')}"
                           if "current_pe" in pe_data else pe_data.get("note","Insufficient data"))
             ev_detail  = (f"Current EV/EBITDA {fmt(ev_data.get('current_ev_ebitda'),'x')} | Normalised {fmt(ev_data.get('hist_ev_ebitda_norm'),'x')}"
                           if "current_ev_ebitda" in ev_data else ev_data.get("note","Insufficient data"))
+            pf_detail  = (f"FY+2 EPS {fmt(pf_data.get('forward_eps'),prefix='₹',dec=1)} | Target P/E {fmt(pf_data.get('target_multiple'),'x')} | Target {fmt(pf_data.get('target_price'),prefix='₹',dec=0)} | Upside {fmt(pf_data.get('upside_pct'),'%')}"
+                          if pf_data else "")
+            platform_bar = score_bar_html(pf_s, "Forward EPS Multiple (exchange/platform)", w_platform_pct) if w_platform_pct else ""
+            platform_line = f'<br><strong style="color:#B0BCC8;">Platform EPS:</strong> {pf_detail}' if pf_detail else ""
             st.markdown(
                 f'<div class="card">'
                 f'<div style="font-size:13px;font-weight:700;color:#E2E8F0;margin-bottom:14px;">'
                 f'Factor Score Breakdown '
                 f'<span style="font-size:10px;color:#8B9AB5;">(Quality {quality_sc:.0f}/100 → dynamic weights)</span></div>'
+                + platform_bar
                 + score_bar_html(dcf_s, f"📐 DCF Intrinsic Value vs CMP", w_dcf_pct)
                 + score_bar_html(pe_s,  f"📊 P/E Mean Reversion (PEG anchor)", w_pe_pct)
                 + score_bar_html(ev_s,  f"🏭 EV/EBITDA vs Historical Norm", w_ev_pct)
@@ -1062,6 +1550,7 @@ with tab_dcf:
                 f'<strong style="color:#B0BCC8;">DCF:</strong> {dcf_detail}<br>'
                 f'<strong style="color:#B0BCC8;">P/E:</strong> {pe_detail}<br>'
                 f'<strong style="color:#B0BCC8;">EV/EBITDA:</strong> {ev_detail}'
+                f'{platform_line}'
                 f'</div></div>', unsafe_allow_html=True,
             )
 
@@ -1201,6 +1690,7 @@ st.markdown(
     '<div style="text-align:center;color:#8B9AB5;font-size:12px;padding:10px 0;">'
     'EquityLens — Automated equity research for NSE-listed companies.<br>'
     'Data: <a href="https://www.screener.in" target="_blank" style="color:#4A90D9;">Screener.in</a>'
-    ' &nbsp;|&nbsp; Not investment advice. All figures ₹ Crore unless stated.'
+    ' &nbsp;|&nbsp; Research tool only, not investment advice. Consult a SEBI-registered investment advisor or qualified financial professional before making investment decisions. All figures ₹ Crore unless stated.'
     '</div>', unsafe_allow_html=True,
 )
+

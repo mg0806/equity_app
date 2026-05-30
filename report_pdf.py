@@ -52,6 +52,31 @@ def _lv(lst, default=np.nan):
     return default
 
 
+def _safe_text(value, limit=140):
+    text = str(value if value is not None else "—")
+    return text[:limit] + ("..." if len(text) > limit else "")
+
+
+def _small_table(rows, col_widths=None, header=True):
+    table = Table(rows, colWidths=col_widths)
+    style = [
+        ("FONTSIZE", (0,0), (-1,-1), 7.3),
+        ("GRID", (0,0), (-1,-1), 0.25, colors.HexColor("#C0C0C0")),
+        ("VALIGN", (0,0), (-1,-1), "TOP"),
+        ("TOPPADDING", (0,0), (-1,-1), 2.5),
+        ("BOTTOMPADDING", (0,0), (-1,-1), 2.5),
+        ("ROWBACKGROUNDS", (0,1 if header else 0), (-1,-1), [LIGHT_GREY, WHITE]),
+    ]
+    if header:
+        style += [
+            ("BACKGROUND", (0,0), (-1,0), DARK_BLUE),
+            ("TEXTCOLOR", (0,0), (-1,0), WHITE),
+            ("FONTNAME", (0,0), (-1,0), "Helvetica-Bold"),
+        ]
+    table.setStyle(TableStyle(style))
+    return table
+
+
 def _make_trend_chart(r: dict, ticker: str) -> io.BytesIO:
     """Matplotlib chart embedded in PDF."""
     years   = r["years"]
@@ -110,7 +135,8 @@ def _make_dupont_chart(r: dict, ticker: str) -> io.BytesIO:
 
 
 def generate_pdf(ticker: str, data: dict, r: dict, flags: list,
-                 peer_df=None, dcf_result: dict = None) -> bytes:
+                 peer_df=None, dcf_result: dict = None,
+                 market_ready: dict = None) -> bytes:
     """
     Generate full 2-page PDF report. Returns bytes.
     """
@@ -361,12 +387,203 @@ def generate_pdf(ticker: str, data: dict, r: dict, flags: list,
         story.append(pt)
         story.append(Spacer(1, 6))
 
+    if market_ready:
+        story.append(PageBreak())
+        story.append(p2h); story.append(Spacer(1, 7))
+        story.append(Paragraph("Investment Thesis & Decision Dashboard", sec_s))
+
+        target = market_ready.get("target", {})
+        risk = market_ready.get("risk", {})
+        conf = market_ready.get("confidence", {})
+        dq = market_ready.get("data_quality", {})
+        tech = market_ready.get("technical", {})
+        backtest = market_ready.get("backtest", {})
+        explain = market_ready.get("explainability", {})
+        quarterly = market_ready.get("quarterly", {})
+        valuation_bands = market_ready.get("valuation_bands", {})
+        revision = market_ready.get("earnings_revision", {})
+        momentum = market_ready.get("momentum", {})
+        reliability = market_ready.get("source_reliability", {})
+        sector_val = market_ready.get("sector_valuation", {})
+        signal = dcf_result.get("signal", "N/A") if dcf_result else "N/A"
+
+        decision_rows = [
+            ["Final Signal", signal, "Blended Target", _fmt(target.get("target_price"), prefix="₹", decimals=0)],
+            ["Target Upside", _fmt(target.get("upside_pct"), "%"), "Signal Confidence", f"{_fmt(conf.get('score'), decimals=0)} / 100 ({conf.get('rating','N/A')})"],
+            ["Risk Score", f"{_fmt(risk.get('score'), decimals=0)} / 100 ({risk.get('rating','N/A')})", "Data Quality", f"{_fmt(dq.get('score'), decimals=0)} / 100 ({dq.get('rating','N/A')})"],
+            ["52W Position", _fmt(tech.get("position_52w_pct"), "%"), "1Y Return / Vol", f"{_fmt(tech.get('return_1y_pct'), '%')} / {_fmt(tech.get('volatility_1y_pct'), '%')}"],
+            ["Beta vs Nifty", _fmt(tech.get("beta_vs_nifty"), "x", decimals=2), "Backtest Readiness", backtest.get("status", "N/A")],
+            ["Sector Model", sector_val.get("sector_model", "N/A"), "Source Reliability", f"{_fmt(reliability.get('score'), decimals=0)} / 100 ({reliability.get('rating','N/A')})"],
+            ["Revision / Momentum", f"{revision.get('rating','N/A')} / {momentum.get('rating','N/A')}", "Valuation Band", valuation_bands.get("rating", "N/A")],
+        ]
+        story.append(_small_table(decision_rows, [36*mm, 48*mm, 40*mm, 58*mm], header=False))
+        story.append(Spacer(1, 6))
+
+        story.append(Paragraph("Target Price Bridge", sec_s))
+        components = target.get("components")
+        if components is not None and not components.empty:
+            rows = [["Model", "Target", "Weight %", "Rationale"]]
+            for _, row in components.iterrows():
+                rows.append([
+                    _safe_text(row.get("Model"), 24),
+                    _fmt(row.get("Target"), prefix="₹", decimals=0),
+                    _fmt(row.get("Weight %"), "%"),
+                    _safe_text(row.get("Note"), 75),
+                ])
+            story.append(_small_table(rows, [32*mm, 30*mm, 24*mm, 95*mm]))
+        else:
+            story.append(Paragraph("Target bridge unavailable due to incomplete valuation inputs.", body_s))
+        story.append(Spacer(1, 6))
+
+        story.append(Paragraph("Forward Financial Forecast", sec_s))
+        forecast = market_ready.get("forecast")
+        if forecast is not None and not forecast.empty:
+            cols = ["Year", "Revenue", "EBITDA", "PAT", "EPS", "FCFF", "EBITDA Margin %"]
+            rows = [cols]
+            for _, row in forecast[cols].iterrows():
+                rows.append([
+                    row.get("Year"),
+                    _fmt(row.get("Revenue"), decimals=0),
+                    _fmt(row.get("EBITDA"), decimals=0),
+                    _fmt(row.get("PAT"), decimals=0),
+                    _fmt(row.get("EPS"), decimals=2),
+                    _fmt(row.get("FCFF"), decimals=0),
+                    _fmt(row.get("EBITDA Margin %"), "%"),
+                ])
+            story.append(_small_table(rows, [20*mm, 27*mm, 27*mm, 27*mm, 23*mm, 27*mm, 30*mm]))
+        story.append(Spacer(1, 6))
+
+        story.append(Paragraph("Risk, Confidence & Data Quality Thesis", sec_s))
+        risk_lines = risk.get("reasons", []) or ["No major model-level risk flags."]
+        warn_lines = dq.get("warnings", []) or ["Core data is complete."]
+        conf_lines = conf.get("notes", []) or ["Neutral confidence inputs."]
+        thesis = (
+            f"<b>Risk drivers:</b> {'; '.join(_safe_text(x, 90) for x in risk_lines[:5])}<br/>"
+            f"<b>Data checks:</b> {'; '.join(_safe_text(x, 90) for x in warn_lines[:5])}<br/>"
+            f"<b>Confidence:</b> {'; '.join(_safe_text(x, 90) for x in conf_lines[:5])}<br/>"
+            f"<b>Historical validation:</b> {backtest.get('historical_validation', {}).get('headline', backtest.get('fundamental_proxy', {}).get('note', 'Unavailable'))}"
+        )
+        story.append(Paragraph(thesis, body_s))
+
+        story.append(Spacer(1, 6))
+        story.append(Paragraph("Top Signal Reasons & Risks", sec_s))
+        reason_text = "; ".join(_safe_text(x, 90) for x in (explain.get("top_reasons", []) or [])[:5]) or "No positive drivers available."
+        risk_text = "; ".join(_safe_text(x, 90) for x in (explain.get("top_risks", []) or [])[:5]) or "No major risks available."
+        story.append(Paragraph(f"<b>Reasons:</b> {reason_text}<br/><b>Risks:</b> {risk_text}", body_s))
+
+        story.append(Spacer(1, 6))
+        story.append(Paragraph("Quarterly, Valuation Band & Market Overlay", sec_s))
+        overlay_rows = [
+            ["Area", "Rating", "Key Metric"],
+            ["Quarterly/TTM", quarterly.get("rating", "N/A"), f"Revenue YoY {_fmt(quarterly.get('revenue_yoy_pct'), '%')} | PAT YoY {_fmt(quarterly.get('pat_yoy_pct'), '%')}"],
+            ["Valuation Band", valuation_bands.get("rating", "N/A"), f"Price percentile {_fmt(valuation_bands.get('price_percentile'), '%')}"],
+            ["Earnings Revision", revision.get("rating", "N/A"), "; ".join(_safe_text(x, 65) for x in (revision.get("drivers", []) or [])[:2])],
+            ["Momentum", momentum.get("rating", "N/A"), f"Score {momentum.get('score', 'N/A')}"],
+            ["Sector Model", sector_val.get("sector_model", "N/A"), f"Target {_fmt(sector_val.get('target_price'), prefix='â‚¹', decimals=0)}"],
+        ]
+        story.append(_small_table(overlay_rows, [38*mm, 40*mm, 95*mm]))
+
+        validation = backtest.get("historical_validation", {})
+        v_summary = validation.get("summary")
+        if v_summary is not None and hasattr(v_summary, "empty") and not v_summary.empty:
+            story.append(Spacer(1, 6))
+            story.append(Paragraph("Historical Signal Validation", sec_s))
+            story.append(Paragraph(
+                f"<b>{_safe_text(validation.get('headline'), 180)}</b><br/>"
+                f"Evidence quality: {validation.get('evidence_quality', 'N/A')} | "
+                f"Windows: {validation.get('observations', 'N/A')} | "
+                f"{_safe_text(validation.get('note'), 160)}",
+                body_s,
+            ))
+            rows = [["Signal", "Obs", "Median 3M", "Median 6M", "Median 12M", "12M Hit", "Max DD"]]
+            for _, row in v_summary.iterrows():
+                rows.append([
+                    row.get("Signal"),
+                    _fmt(row.get("Observations"), decimals=0),
+                    _fmt(row.get("Median 3M Return %"), "%"),
+                    _fmt(row.get("Median 6M Return %"), "%"),
+                    _fmt(row.get("Median 12M Return %"), "%"),
+                    _fmt(row.get("12M Hit Rate %"), "%"),
+                    _fmt(row.get("Median Forward Max Drawdown %"), "%"),
+                ])
+            story.append(_small_table(rows, [24*mm, 18*mm, 26*mm, 26*mm, 28*mm, 24*mm, 24*mm]))
+
+        ranked = market_ready.get("peer_ranking")
+        if ranked is not None and not ranked.empty:
+            story.append(Spacer(1, 6))
+            story.append(Paragraph("Peer Quality Ranking", sec_s))
+            cols = [c for c in ["Company", "Ticker", "Peer Score", "ROE %", "ROCE %", "Revenue CAGR 3Y %", "P/E", "D/E"] if c in ranked.columns]
+            rows = [cols]
+            for _, row in ranked.head(8).iterrows():
+                rows.append([
+                    _safe_text(row.get(c), 22) if c in ("Company", "Ticker") else _fmt(row.get(c), decimals=1)
+                    for c in cols
+                ])
+            story.append(_small_table(rows, [45*mm] + [19*mm]*(len(cols)-1)))
+
+        story.append(PageBreak())
+        story.append(p2h); story.append(Spacer(1, 7))
+        story.append(Paragraph("Research Methodology & Source Audit", sec_s))
+        method = (
+            "<b>Fundamental data:</b> Screener.in financial statements are parsed into historical P&L, balance sheet and cash-flow series. "
+            "Ratios are recalculated internally to keep the model auditable.<br/>"
+            "<b>Market data:</b> Yahoo Finance enriches the report with price history, volatility, beta and returns when available.<br/>"
+            "<b>Exchange events:</b> NSE/BSE corporate actions and announcements are included when public endpoints are available.<br/>"
+            "<b>Valuation:</b> The report combines FCFF DCF, relative valuation, peer multiples and sector/platform-specific logic where applicable.<br/>"
+            "<b>Signal:</b> BUY/HOLD/SELL is based on margin of safety, business quality, risk, Monte Carlo validation and model confidence.<br/>"
+            "<b>Limitations:</b> This is an automated research aid and does not include management interviews, channel checks, unpublished estimates or legal due diligence."
+        )
+        story.append(Paragraph(method, body_s)); story.append(Spacer(1, 6))
+
+        source_rows = [["Field", "Source / Status"]]
+        source_rows.append(["Report storage", "Model-versioned SQLite snapshot enabled"])
+        for key, source in (data.get("sources") or {}).items():
+            source_rows.append([_safe_text(key, 30), _safe_text(source, 100)])
+        for source, status in (data.get("source_status") or {}).items():
+            source_rows.append([_safe_text(f"{source} status", 30), _safe_text(status, 100)])
+        if len(source_rows) > 1:
+            story.append(_small_table(source_rows, [52*mm, 120*mm]))
+            story.append(Spacer(1, 6))
+
+        exchange_events = data.get("exchange_events", {}) or {}
+        actions = exchange_events.get("corporate_actions")
+        announcements = exchange_events.get("announcements")
+        if actions is not None and hasattr(actions, "empty") and not actions.empty:
+            cols = [c for c in ["symbol", "subject", "exDate", "recDate"] if c in actions.columns]
+            if cols:
+                story.append(Paragraph("Recent NSE/BSE Corporate Actions", sec_s))
+                rows = [cols] + actions[cols].head(5).fillna("").astype(str).values.tolist()
+                story.append(_small_table(rows, [28*mm, 78*mm, 32*mm, 32*mm][:len(cols)]))
+                story.append(Spacer(1, 6))
+        if announcements is not None and hasattr(announcements, "empty") and not announcements.empty:
+            cols = [c for c in ["symbol", "desc", "attchmntText", "an_dt"] if c in announcements.columns]
+            if cols:
+                story.append(Paragraph("Recent NSE/BSE Announcements", sec_s))
+                rows = [cols] + announcements[cols].head(5).fillna("").astype(str).values.tolist()
+                story.append(_small_table(rows, [24*mm, 45*mm, 75*mm, 26*mm][:len(cols)]))
+                story.append(Spacer(1, 6))
+
+        story.append(Paragraph("Model Checklist", sec_s))
+        checklist = [
+            ["Area", "What the model checks"],
+            ["Growth", "Revenue, PAT and EPS CAGR; forecast growth; mean reversion"],
+            ["Quarterly", "Latest quarterly growth, QoQ/YoY change, TTM EPS/PAT and margin direction"],
+            ["Profitability", "Operating margin, net margin, ROE, ROCE, DuPont drivers"],
+            ["Balance Sheet", "Debt/equity, current ratio, quick ratio, interest cover"],
+            ["Cash Flow", "CFO, FCF, CFO/PAT conversion, capex intensity"],
+            ["Valuation", "DCF, P/E, P/B, peer median, valuation bands and sector-specific models"],
+            ["Validation", "Rolling 1M/3M/6M/12M forward returns, hit rates, excess returns and drawdown by signal"],
+            ["Risk", "Red flags, leverage, volatility, valuation stretch, reliability and data completeness"],
+        ]
+        story.append(_small_table(checklist, [40*mm, 130*mm]))
+
     # ── DISCLAIMER ──
     story.append(HRFlowable(width="100%", thickness=0.5, color=colors.grey))
     story.append(Spacer(1, 4))
     story.append(Paragraph(
         "Disclaimer: This report is auto-generated for educational purposes only. "
-        "Not investment advice. Data from Screener.in. All figures ₹ Crore unless stated.",
+        "It is a research tool, not investment advice. Consult a SEBI-registered investment advisor or qualified financial professional before making any investment decision. "
+        "Data from Screener.in, Yahoo Finance and NSE/BSE public pages where available. All figures ₹ Crore unless stated.",
         small_s))
 
     doc.build(story)

@@ -4,7 +4,7 @@ ratios.py — Fixed version. All extraction bugs resolved.
 
 import numpy as np
 import pandas as pd
-from scraper import extract_series, get_year_labels
+from scraper import extract_series, get_year_labels, is_index_or_benchmark
 
 
 def safe_div(a, b):
@@ -47,6 +47,7 @@ def calculate_ratios(data: dict, n_years: int = 5) -> dict:
     pat          = extract_series(pl, [r"Net Profit", r"^PAT$", r"Profit after tax"], n_years)
     interest     = extract_series(pl, [r"^Interest", r"Finance Cost"], n_years)
     depreciation = extract_series(pl, [r"^Depreciation", r"Amortisation"], n_years)
+    pbt          = extract_series(pl, [r"Profit before tax", r"^PBT$"], n_years)
     tax          = extract_series(pl, [r"^Tax", r"Income Tax"], n_years)
     eps          = extract_series(pl, [r"EPS", r"Earnings Per Share"], n_years)
     raw_material = extract_series(pl, [r"Raw Material", r"Material Cost"], n_years)
@@ -89,6 +90,7 @@ def calculate_ratios(data: dict, n_years: int = 5) -> dict:
 
     r.update({
         "revenue": revenue, "ebitda": ebitda, "pat": pat, "interest": interest,
+        "pbt": pbt,
         "depreciation": depreciation, "tax": tax, "eps": eps,
         "total_assets": total_assets, "total_debt": total_debt, "equity": equity,
         "current_assets": current_assets, "current_liab": current_liab,
@@ -191,6 +193,18 @@ def calculate_ratios(data: dict, n_years: int = 5) -> dict:
     r["eps_cagr_3y"]     = cagr(eps, 3)
     r["eps_cagr_5y"]     = cagr(eps, 5)
 
+    # â”€â”€ Market history metrics from aggregator/Yahoo â”€â”€
+    market_data = data.get("market_data", {}) or {}
+    r["price_return_1m_pct"] = market_data.get("return_1m_pct", np.nan)
+    r["price_return_3m_pct"] = market_data.get("return_3m_pct", np.nan)
+    r["price_return_1y_pct"] = market_data.get("return_1y_pct", np.nan)
+    r["volatility_1y_pct"] = market_data.get("volatility_1y_pct", np.nan)
+    r["beta_vs_nifty"] = market_data.get("beta_vs_nifty", np.nan)
+    r["price_history_available"] = bool(
+        hasattr(market_data.get("price_history"), "empty")
+        and not market_data.get("price_history").empty
+    )
+
     return r
 
 
@@ -214,6 +228,8 @@ def build_peer_comparison(target_ticker, target_data, target_r, peer_data_list):
     })
     for pdata in peer_data_list:
         try:
+            if is_index_or_benchmark(pdata.get("ticker"), pdata.get("company_name")):
+                continue
             pr = calculate_ratios(pdata)
             rows.append({
                 "Company": pdata.get("company_name", pdata.get("ticker","")),

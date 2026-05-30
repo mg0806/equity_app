@@ -43,6 +43,23 @@ def _safe_float(val, default=np.nan):
         return default
 
 
+def _is_exchange_platform(data: dict) -> bool:
+    """Detect exchange / capital-market infrastructure businesses such as BSE."""
+    fields = " ".join(str(data.get(k, "") or "") for k in (
+        "ticker", "company_name", "sector", "industry", "about"
+    )).lower()
+    ticker = str(data.get("ticker", "") or "").upper().strip()
+    if ticker in {"BSE", "BSEL"}:
+        return True
+
+    keyword_hits = sum(1 for kw in (
+        "stock exchange", "exchange", "clearing", "settlement",
+        "securities market", "capital market", "star mf", "mutual fund platform",
+        "market data", "depository"
+    ) if kw in fields)
+    return keyword_hits >= 2
+
+
 # ─────────────────────────────────────────────
 # BUSINESS TYPE CLASSIFICATION
 # ─────────────────────────────────────────────
@@ -61,6 +78,9 @@ def classify_business_type(r: dict, data: dict) -> str:
     -------
     str : One of 'stable', 'cyclical', 'high-margin-stable', 'commodity'
     """
+    if _is_exchange_platform(data):
+        return "exchange-platform"
+
     operating_margins = _valid_floats(r.get("operating_margin", []))
     revenues          = _valid_floats(r.get("revenue", []))
     fcf_vals          = _valid_floats(r.get("fcf", []))
@@ -315,6 +335,313 @@ def calculate_business_quality(r: dict, peer_df=None) -> tuple:
 
 
 # ─────────────────────────────────────────────
+# SCREENER-ALIGNED ASSUMPTION ENGINE (NEW)
+# ─────────────────────────────────────────────
+
+def derive_assumptions_from_screener(data: dict, r: dict, peer_df=None) -> dict:
+    """
+    Derive DCF assumptions directly from Screener.in data & peer benchmarks.
+    This aligns assumptions with actual Screener metrics and analyst data.
+    
+    Priority order:
+    1. Screener analyst estimates / growth projections
+    2. Peer median metrics (from peer_df or fetched peers)
+    3. Historical calculations (fallback)
+    """
+    
+    # ── Business type classification ──
+    biz_type = classify_business_type(r, data)
+    quality_score, quality_components = calculate_business_quality(r, peer_df)
+    
+    # Get Screener-provided metrics
+    screener_ratios = data.get("all_ratios", {})
+    screener_growth = data.get("growth_estimate", {})
+    screener_growth_table = data.get("growth_table", {})
+    assumption_sources = {}
+    
+    # ── REVENUE GROWTH ──────────────────────────────────
+    # Priority: 1) Analyst estimate, 2) Peer median CAGR, 3) Historical CAGR
+    
+    base_growth = None
+    
+    # Check for analyst growth estimate
+    if "cagr_estimate" in screener_growth and screener_growth["cagr_estimate"]:
+        base_growth = float(screener_growth["cagr_estimate"])
+        assumption_sources["growth"] = "Screener estimate"
+    elif "found_growth" in screener_growth and screener_growth["found_growth"]:
+        base_growth = float(screener_growth["found_growth"])
+        assumption_sources["growth"] = "Screener estimate"
+
+    # Prefer Screener's own CAGR summary table when available.
+    raw_growth = None
+    sales_growth = screener_growth_table.get("Compounded Sales Growth", {})
+    if base_growth is None and sales_growth:
+        growth_points = []
+        weights = []
+        for period, weight in (("TTM", 0.20), ("3 Years", 0.50), ("5 Years", 0.30)):
+            val = _safe_float(sales_growth.get(period), np.nan)
+            if not np.isnan(val):
+                growth_points.append(val / 100)
+                weights.append(weight)
+        if growth_points:
+            base_growth = float(np.average(growth_points, weights=weights))
+            raw_growth = base_growth
+            assumption_sources["growth"] = "Screener CAGR table"
+    
+    # Fallback: Use peer median growth or historical
+    if base_growth is None:
+        cagr3 = _safe_float(r.get("revenue_cagr_3y"))
+        cagr5 = _safe_float(r.get("revenue_cagr_5y"))
+        c3 = None if np.isnan(cagr3) else cagr3
+        c5 = None if np.isnan(cagr5) else cagr5
+        
+        if c3 is not None and c5 is not None:
+            raw_growth = (0.60 * c3 + 0.40 * c5) / 100
+        elif c3 is not None:
+            raw_growth = c3 / 100
+        elif c5 is not None:
+            raw_growth = c5 / 100
+        else:
+            raw_growth = 0.10
+        assumption_sources["growth"] = "historical CAGR fallback"
+        
+        # Mean reversion to sector/business type anchor
+        BIZ_PARAMS = {
+            "exchange-platform":   {"mr_anchor": 0.22, "mr_weight": 0.20},
+            "high-margin-stable": {"mr_anchor": 0.12, "mr_weight": 0.25},
+            "stable":             {"mr_anchor": 0.10, "mr_weight": 0.30},
+            "cyclical":           {"mr_anchor": 0.08, "mr_weight": 0.40},
+            "commodity":          {"mr_anchor": 0.07, "mr_weight": 0.50},
+        }
+        bp = BIZ_PARAMS.get(biz_type, {"mr_anchor": 0.10, "mr_weight": 0.30})
+        
+        base_growth = (1 - bp["mr_weight"]) * raw_growth + bp["mr_weight"] * bp["mr_anchor"]
+    else:
+        BIZ_PARAMS = {
+            "exchange-platform":   {"mr_anchor": 0.22, "mr_weight": 0.20},
+            "high-margin-stable": {"mr_anchor": 0.12, "mr_weight": 0.25},
+            "stable":             {"mr_anchor": 0.10, "mr_weight": 0.30},
+            "cyclical":           {"mr_anchor": 0.08, "mr_weight": 0.40},
+            "commodity":          {"mr_anchor": 0.07, "mr_weight": 0.50},
+        }
+        bp = BIZ_PARAMS.get(biz_type, {"mr_anchor": 0.10, "mr_weight": 0.30})
+        raw_growth = base_growth if raw_growth is None else raw_growth
+        base_growth = (1 - bp["mr_weight"]) * base_growth + bp["mr_weight"] * bp["mr_anchor"]
+    
+    # Apply business-type ceiling
+    GROWTH_CEILINGS = {
+        "exchange-platform":   0.40,
+        "high-margin-stable": 0.30,
+        "stable":             0.25,
+        "cyclical":           0.20,
+        "commodity":          0.18,
+    }
+    base_growth = float(np.clip(base_growth, 0.03, GROWTH_CEILINGS.get(biz_type, 0.25)))
+    
+    # ── EBITDA / OPERATING MARGIN ──────────────────────
+    # Priority: 1) Peer median, 2) Screener ratios, 3) Historical
+    
+    hist_margins = _valid_floats(r.get("operating_margin", []))
+    hist_median_margin = float(np.median(hist_margins)) if hist_margins else 15.0
+    
+    base_ebitda_margin_pct = hist_median_margin
+    peer_median_margin = None
+    assumption_sources["margin"] = "Screener profit-loss OPM history"
+    
+    # Check peer margins for benchmarking
+    if peer_df is not None and "Net Margin %" in peer_df.columns:
+        peer_margins = _valid_floats(peer_df["Net Margin %"].dropna().tolist())
+        if peer_margins:
+            peer_median_margin = float(np.median(peer_margins))
+            # Blend with peer median (70% historical, 30% peer)
+            base_ebitda_margin_pct = 0.70 * hist_median_margin + 0.30 * peer_median_margin
+            assumption_sources["margin"] = "Screener OPM history blended with peer median"
+    
+    # Apply business-type ceiling
+    MARGIN_CEILINGS = {
+        "exchange-platform":   70.0,
+        "high-margin-stable": 60.0,
+        "stable":             45.0,
+        "cyclical":           35.0,
+        "commodity":          20.0,
+    }
+    base_ebitda_margin_pct = float(np.clip(base_ebitda_margin_pct, 3.0, MARGIN_CEILINGS.get(biz_type, 45.0)))
+    
+    # ── MARGIN DELTA (TREND) ───────────────────────────
+    if len(hist_margins) >= 3:
+        raw_delta = (hist_margins[-1] - hist_margins[0]) / (len(hist_margins) - 1) / 100
+        if biz_type in ("cyclical", "commodity"):
+            margin_delta = float(np.clip(raw_delta, -0.015, 0.010))
+        else:
+            margin_delta = float(np.clip(raw_delta, -0.020, 0.020))
+    else:
+        margin_delta = 0.001
+    
+    # ── CAPEX & WORKING CAPITAL (WITH BUSINESS-TYPE CEILINGS) ──
+    rev_vals   = _valid_floats(r.get("revenue", []))
+    capex_vals = _valid_floats(r.get("capex", []))
+    capex_ratios = []
+    for c_v, r_v in zip(capex_vals[-5:], rev_vals[-5:]):
+        if r_v > 0:
+            capex_ratios.append(abs(c_v) / r_v)
+    
+    if capex_ratios:
+        capex_median = float(np.median(capex_ratios))
+        CAPEX_CEILING = {
+            "exchange-platform":   0.08,
+            "high-margin-stable": 0.08,
+            "stable":             0.10,
+            "cyclical":           0.15,
+            "commodity":          0.20,
+        }
+        capex_ceiling = CAPEX_CEILING.get(biz_type, 0.10)
+        capex_pct = float(np.clip(capex_median, 0.02, capex_ceiling))
+    else:
+        capex_pct = 0.07
+    
+    # Working capital
+    pat_vals   = _valid_floats(r.get("pat", []))
+    cfo_vals   = _valid_floats(r.get("cfo", []))
+    wc_changes = []
+    for cf_v, pt_v, rv in zip(cfo_vals[-5:], pat_vals[-5:], rev_vals[-5:]):
+        if rv > 0 and pt_v != 0:
+            wc_changes.append(abs(pt_v - cf_v) / rv)
+    
+    if wc_changes:
+        wc_median = float(np.median(wc_changes))
+        WC_CEILING = {
+            "exchange-platform":   0.015,
+            "high-margin-stable": 0.02,
+            "stable":             0.025,
+            "cyclical":           0.03,
+            "commodity":          0.04,
+        }
+        wc_ceiling = WC_CEILING.get(biz_type, 0.025)
+        wc_pct = float(np.clip(wc_median, 0.005, wc_ceiling))
+    else:
+        wc_pct = 0.015
+    
+    # ── EFFECTIVE TAX RATE ──────────────────────────────
+    tax_vals = _valid_floats(r.get("tax", []))
+    pbt_vals = _valid_floats(r.get("pbt", []))
+    eff_tax_rates = []
+    for tx, pb in zip(tax_vals, pbt_vals):
+        if pb > 0:
+            eff_tax_rates.append(tx / 100 if 0 <= tx <= 100 else tx / pb)
+    if eff_tax_rates:
+        tax_rate_est = float(np.clip(np.median(eff_tax_rates), 0.15, 0.35))
+    else:
+        tax_rate_est = 0.25
+    
+    # ── WACC COMPONENTS ────────────────────────────────
+    debt_vals     = _valid_floats(r.get("total_debt", []))
+    equity_vals   = _valid_floats(r.get("equity", []))
+    latest_debt   = debt_vals[-1]   if debt_vals   else 0.0
+    latest_equity = equity_vals[-1] if equity_vals else 1.0
+    de_ratio = latest_debt / latest_equity if latest_equity > 0 else 0.5
+    
+    # Try to use Screener's ROE if available, else calculated
+    roe_from_screener = data.get("roe")
+    if roe_from_screener and not np.isnan(float(roe_from_screener or np.nan)):
+        roe_val = float(roe_from_screener) / 100
+    else:
+        roe_vals = _valid_floats(r.get("roe", []))
+        roe_val = float(np.median(roe_vals)) / 100 if roe_vals else 0.12
+    
+    # Use ROE to estimate unlevered beta
+    UNLEV_BETA = {
+        "exchange-platform":   0.90,
+        "high-margin-stable": 0.70,
+        "stable":             0.80,
+        "cyclical":           1.00,
+        "commodity":          1.10,
+    }
+    unlevered_beta = UNLEV_BETA[biz_type]
+    levered_beta   = unlevered_beta * (1 + (1 - tax_rate_est) * de_ratio)
+    levered_beta   = float(np.clip(levered_beta, 0.5, 2.5))
+    
+    rfr = 0.07
+    erp = 0.055
+    cost_of_equity = rfr + levered_beta * erp
+    
+    # Cost of debt from Screener or calculated
+    interest_vals = _valid_floats(r.get("interest", []))
+    if interest_vals and debt_vals and debt_vals[-1] > 0:
+        raw_cod = interest_vals[-1] / debt_vals[-1]
+        credit_floor = 0.06 + 0.02 * min(de_ratio, 2.0)
+        cost_of_debt = float(np.clip(raw_cod, credit_floor, 0.16))
+    else:
+        cost_of_debt = 0.09
+    
+    market_cap = float(data.get("market_cap") or 0)
+    total_cap  = market_cap + latest_debt
+    w_eq   = market_cap / total_cap if total_cap > 0 else 0.8
+    w_dt   = 1 - w_eq
+    base_wacc = w_eq * cost_of_equity + w_dt * cost_of_debt * (1 - tax_rate_est)
+    base_wacc = float(np.clip(base_wacc, 0.07, 0.18))
+    
+    # ── TERMINAL GROWTH RATE ───────────────────────────
+    gdp_proxy = 0.07
+    TGR_FLOOR = {
+        "exchange-platform":   0.04,
+        "high-margin-stable": 0.04,
+        "stable":             0.03,
+        "cyclical":           0.03,
+        "commodity":          0.03,
+    }
+    tgr_floor = TGR_FLOOR.get(biz_type, 0.03)
+    base_tgr = float(np.clip(
+        max(gdp_proxy / 2, tgr_floor, base_growth / 2),
+        tgr_floor, 0.06
+    ))
+    
+    if base_tgr >= base_wacc:
+        base_tgr = base_wacc - 0.02
+    
+    # ── SCENARIO MULTIPLIERS ───────────────────────────
+    bear_growth = float(np.clip(base_growth * 0.50, 0.02, 0.15))
+    bull_growth = float(np.clip(base_growth * 1.60, base_growth + 0.03, 0.40))
+    
+    return {
+        # Growth
+        "base_growth":          round(base_growth, 4),
+        "bear_growth":          round(bear_growth, 4),
+        "bull_growth":          round(bull_growth, 4),
+        # Margins
+        "base_ebitda_margin":   round(base_ebitda_margin_pct, 2),
+        "base_margin_delta":    round(margin_delta, 4),
+        "bear_margin_delta":    round(margin_delta - 0.005, 4),
+        "bull_margin_delta":    round(margin_delta + 0.005, 4),
+        # Capital structure / WACC
+        "base_wacc":            round(base_wacc, 4),
+        "beta":                 round(levered_beta, 2),
+        "risk_free_rate":       rfr,
+        "erp":                  erp,
+        "cost_of_debt":         round(cost_of_debt, 4),
+        "tax_rate":             round(tax_rate_est, 4),
+        # Capex / WC
+        "capex_pct":            round(capex_pct, 4),
+        "wc_pct":               round(wc_pct, 4),
+        # Terminal growth
+        "base_tgr":             round(base_tgr, 4),
+        "bear_tgr":             round(max(base_tgr * 0.80, tgr_floor), 4),
+        "bull_tgr":             round(min(base_tgr * 1.25, 0.06), 4),
+        # Meta
+        "auto_derived":         True,
+        "source":               "screener_aligned",
+        "de_ratio":             round(de_ratio, 2),
+        "raw_growth_pct":       round((raw_growth or base_growth) * 100, 2),
+        "mr_weight":            bp["mr_weight"],
+        "assumption_sources":   assumption_sources,
+        "business_type":        biz_type,
+        "valuation_model":      "exchange_forward_eps_plus_dcf" if biz_type == "exchange-platform" else "dcf_composite",
+        "quality_score":        round(quality_score, 1),
+        "quality_components":   quality_components,
+        "peer_median_margin":   round(peer_median_margin, 2) if peer_median_margin else None,
+    }
+
+
+# ─────────────────────────────────────────────
 # HISTORY-DERIVED ASSUMPTION ENGINE (ENHANCED)
 # ─────────────────────────────────────────────
 
@@ -350,6 +677,13 @@ def derive_assumptions_from_history(data: dict, r: dict, peer_df=None) -> dict:
     # margin_ceiling : absolute cap on EBITDA margin assumption
     # tgr_floor      : minimum terminal growth rate
     BIZ_PARAMS = {
+        "exchange-platform": {
+            "growth_ceiling": 0.40,
+            "mr_anchor":      0.22,
+            "mr_weight":      0.20,
+            "margin_ceiling": 70.0,
+            "tgr_floor":      0.04,
+        },
         "high-margin-stable": {
             "growth_ceiling": 0.30,
             "mr_anchor":      0.12,   # IT/pharma can sustain 12% long-run
@@ -445,8 +779,22 @@ def derive_assumptions_from_history(data: dict, r: dict, peer_df=None) -> dict:
     for c_v, r_v in zip(capex_vals[-n:], rev_vals[-n:]):
         if r_v > 0:
             capex_ratios.append(abs(c_v) / r_v)
-    capex_pct = (float(np.clip(np.median(capex_ratios), 0.02, 0.25))
-                 if capex_ratios else 0.07)
+    
+    # Calculate capex % with business-type appropriate ceilings
+    if capex_ratios:
+        capex_median = float(np.median(capex_ratios))
+        # Business-type capex ceilings (more conservative for service companies)
+        CAPEX_CEILING = {
+            "exchange-platform":   0.08,
+            "high-margin-stable": 0.08,  # IT, pharma typically 4-8%
+            "stable":             0.10,  # Banks, FMCG typically 5-10%
+            "cyclical":           0.15,  # Autos, heavy machinery 10-15%
+            "commodity":          0.20,  # Steel, cement typically 12-20%
+        }
+        capex_ceiling = CAPEX_CEILING.get(biz_type, 0.10)
+        capex_pct = float(np.clip(capex_median, 0.02, capex_ceiling))
+    else:
+        capex_pct = 0.07
 
     # ── Working capital % revenue ─────────────────────────
     pat_vals   = _valid_floats(r.get("pat", []))
@@ -455,8 +803,22 @@ def derive_assumptions_from_history(data: dict, r: dict, peer_df=None) -> dict:
     for cf_v, pt_v, rv in zip(cfo_vals[-n:], pat_vals[-n:], rev_vals[-n:]):
         if rv > 0 and pt_v != 0:
             wc_changes.append(abs(pt_v - cf_v) / rv)
-    wc_pct = (float(np.clip(np.median(wc_changes), 0.005, 0.05))
-              if wc_changes else 0.015)
+    
+    # Calculate WC % with business-type appropriate ceilings
+    if wc_changes:
+        wc_median = float(np.median(wc_changes))
+        # Business-type WC ceilings (service companies need lower WC)
+        WC_CEILING = {
+            "exchange-platform":   0.015,
+            "high-margin-stable": 0.02,  # IT, pharma typically 0-2%
+            "stable":             0.025, # Banks, FMCG typically 1-3%
+            "cyclical":           0.03,  # Autos, heavy machinery 2-4%
+            "commodity":          0.04,  # Steel, cement typically 2-4%
+        }
+        wc_ceiling = WC_CEILING.get(biz_type, 0.025)
+        wc_pct = float(np.clip(wc_median, 0.005, wc_ceiling))
+    else:
+        wc_pct = 0.015
 
     # ── Effective tax rate ────────────────────────────────
     # Use actual tax expense / PBT where possible
@@ -465,7 +827,7 @@ def derive_assumptions_from_history(data: dict, r: dict, peer_df=None) -> dict:
     eff_tax_rates = []
     for tx, pb in zip(tax_vals, pbt_vals):
         if pb > 0:
-            eff_tax_rates.append(tx / pb)
+            eff_tax_rates.append(tx / 100 if 0 <= tx <= 100 else tx / pb)
     if eff_tax_rates:
         tax_rate_est = float(np.clip(np.median(eff_tax_rates), 0.15, 0.35))
     else:
@@ -480,6 +842,7 @@ def derive_assumptions_from_history(data: dict, r: dict, peer_df=None) -> dict:
 
     # Unlevered beta prior adjusted by business type
     UNLEV_BETA = {
+        "exchange-platform":   0.90,
         "high-margin-stable": 0.70,  # lower systematic risk (IT, pharma)
         "stable":             0.80,
         "cyclical":           1.00,  # higher systematic risk
@@ -556,6 +919,7 @@ def derive_assumptions_from_history(data: dict, r: dict, peer_df=None) -> dict:
         "raw_growth_pct":       round(raw_growth * 100, 2),
         # Business context
         "business_type":        biz_type,
+        "valuation_model":      "exchange_forward_eps_plus_dcf" if biz_type == "exchange-platform" else "dcf_composite",
         "quality_score":        quality_score,
         "quality_components":   quality_components,
         "peer_median_margin":   round(peer_median_margin, 2) if peer_median_margin else None,
@@ -719,6 +1083,7 @@ def generate_investment_signal(
     dict with keys: signal, conviction, reason, mos_required, upside
     """
     upside = dcf_upside_pct if (dcf_upside_pct and not np.isnan(dcf_upside_pct)) else 0.0
+    valuation_label = "blended platform valuation" if business_type == "exchange-platform" else "DCF upside"
 
     # Determine MOS requirement
     if quality_score >= 80:
@@ -735,6 +1100,8 @@ def generate_investment_signal(
         mos_required += 5.0
     elif business_type == "cyclical":
         mos_required += 3.0
+    elif business_type == "exchange-platform":
+        mos_required += 5.0
 
     # Derive signal
     if quality_score < 40:
@@ -753,19 +1120,19 @@ def generate_investment_signal(
             signal    = "STRONG BUY"
             conviction = "High"
             reason    = (f"High-quality business (score {quality_score:.0f}/100, {business_type}) "
-                         f"with {upside:.1f}% DCF upside — well above the {mos_required:.0f}% "
+                         f"with {upside:.1f}% {valuation_label} — well above the {mos_required:.0f}% "
                          f"margin of safety requirement. Composite score {composite_score:+.2f}.")
         else:
             signal    = "BUY"
             conviction = "High" if composite_score > 0.40 else "Moderate"
             reason    = (f"{business_type.title()} business (quality {quality_score:.0f}/100) "
-                         f"with {upside:.1f}% upside exceeds {mos_required:.0f}% MOS requirement. "
+                         f"with {upside:.1f}% {valuation_label} exceeds {mos_required:.0f}% MOS requirement. "
                          f"Composite score {composite_score:+.2f}.")
     elif composite_score < -0.20:
         signal    = "SELL"
         conviction = "Strong" if composite_score < -0.50 else "Moderate"
         reason    = (f"Composite score {composite_score:+.2f} is bearish. "
-                     f"DCF upside {upside:.1f}% is below the {mos_required:.0f}% MOS required "
+                     f"{valuation_label.title()} {upside:.1f}% is below the {mos_required:.0f}% MOS required "
                      f"for the quality score {quality_score:.0f}/100.")
     else:
         signal    = "HOLD"
@@ -786,6 +1153,98 @@ def generate_investment_signal(
 # ─────────────────────────────────────────────
 # COMPOSITE VALUATION SIGNAL (ENHANCED)
 # ─────────────────────────────────────────────
+
+def run_exchange_platform_valuation(
+    data: dict,
+    r: dict,
+    assumptions: dict,
+    shares_outstanding: float,
+    current_price: float,
+) -> dict:
+    """
+    Broker-style valuation for exchange / capital-market infrastructure names.
+
+    Exchanges such as BSE are often valued on FY+2 earnings power, market-share
+    gains, and operating leverage rather than only near-term FCFF.
+    """
+    if not _is_exchange_platform(data) or not current_price or current_price <= 0:
+        return {}
+
+    eps_vals = _valid_floats(r.get("eps", []))
+    pat_vals = _valid_floats(r.get("pat", []))
+    latest_eps = eps_vals[-1] if eps_vals else np.nan
+    if (np.isnan(latest_eps) or latest_eps <= 0) and pat_vals and shares_outstanding:
+        latest_eps = pat_vals[-1] / shares_outstanding
+    if np.isnan(latest_eps) or latest_eps <= 0:
+        return {}
+
+    growth_table = data.get("growth_table", {})
+    profit_growth = growth_table.get("Compounded Profit Growth", {})
+    sales_growth = growth_table.get("Compounded Sales Growth", {})
+
+    growth_points = []
+    weights = []
+    for period, weight in (("TTM", 0.20), ("3 Years", 0.50), ("5 Years", 0.30)):
+        val = _safe_float(profit_growth.get(period), np.nan)
+        if np.isnan(val):
+            val = _safe_float(sales_growth.get(period), np.nan)
+        if not np.isnan(val):
+            growth_points.append(val / 100)
+            weights.append(weight)
+
+    hist_eps_cagr = _safe_float(r.get("eps_cagr_3y"), np.nan)
+    if not np.isnan(hist_eps_cagr):
+        growth_points.append(hist_eps_cagr / 100)
+        weights.append(0.40)
+
+    base_eps_growth = (
+        float(np.average(growth_points, weights=weights))
+        if growth_points else assumptions.get("base_growth", 0.15)
+    )
+
+    base_eps_growth = float(np.clip(base_eps_growth, 0.08, 0.35))
+    bear_eps_growth = float(np.clip(base_eps_growth * 0.55, 0.03, 0.18))
+    bull_eps_growth = float(np.clip(base_eps_growth * 1.35, base_eps_growth + 0.03, 0.45))
+
+    quality_score = float(assumptions.get("quality_score", 50.0))
+    current_pe = _safe_float(data.get("pe_ratio"), np.nan)
+    base_multiple = 30 + (base_eps_growth * 35) + max(quality_score - 60, 0) * 0.12
+    if not np.isnan(current_pe):
+        base_multiple = 0.65 * base_multiple + 0.35 * current_pe
+    base_multiple = float(np.clip(base_multiple, 28.0, 45.0))
+    bear_multiple = float(np.clip(base_multiple - 8.0, 22.0, 36.0))
+    bull_multiple = float(np.clip(base_multiple + 7.0, 38.0, 55.0))
+
+    years_forward = 2
+    scenarios = {}
+    for name, growth, multiple in (
+        ("Bear", bear_eps_growth, bear_multiple),
+        ("Base", base_eps_growth, base_multiple),
+        ("Bull", bull_eps_growth, bull_multiple),
+    ):
+        forward_eps = latest_eps * ((1 + growth) ** years_forward)
+        target_price = forward_eps * multiple
+        upside = (target_price - current_price) / current_price * 100
+        scenarios[name] = {
+            "eps_growth": round(growth, 4),
+            "forward_eps": round(forward_eps, 2),
+            "target_multiple": round(multiple, 1),
+            "target_price": round(target_price, 2),
+            "upside_pct": round(upside, 1),
+        }
+
+    return {
+        "model": "exchange_forward_eps",
+        "description": "FY+2 EPS multiple valuation for exchange/platform businesses",
+        "latest_eps": round(latest_eps, 2),
+        "years_forward": years_forward,
+        "base_eps_growth": round(base_eps_growth, 4),
+        "scenarios": scenarios,
+        "base_target": scenarios["Base"]["target_price"],
+        "base_upside_pct": scenarios["Base"]["upside_pct"],
+        "source_note": "Uses Screener EPS/profit growth with platform-style forward P/E scenarios",
+    }
+
 
 def compute_composite_signal(
     current_price: float,
@@ -816,15 +1275,19 @@ def compute_composite_signal(
 
     quality_score  = float(assumptions.get("quality_score",  50.0))
     business_type  = assumptions.get("business_type", "stable")
+    platform_val   = assumptions.get("platform_valuation", {}) or {}
+    is_platform_model = business_type == "exchange-platform" and bool(platform_val)
 
     # Dynamic DCF weight: higher quality business → trust DCF more
-    if quality_score >= 70:
-        w_dcf, w_pe, w_ev = 0.65, 0.20, 0.15
+    if is_platform_model:
+        w_dcf, w_pe, w_ev, w_platform = 0.20, 0.15, 0.10, 0.55
+    elif quality_score >= 70:
+        w_dcf, w_pe, w_ev, w_platform = 0.65, 0.20, 0.15, 0.0
     elif quality_score >= 50:
-        w_dcf, w_pe, w_ev = 0.50, 0.25, 0.25
+        w_dcf, w_pe, w_ev, w_platform = 0.50, 0.25, 0.25, 0.0
     else:
         # Low quality: give more weight to market-based signals
-        w_dcf, w_pe, w_ev = 0.40, 0.30, 0.30
+        w_dcf, w_pe, w_ev, w_platform = 0.40, 0.30, 0.30, 0.0
 
     # ── Factor 1: DCF upside ──────────────────────────────
     dcf_score      = 0.0
@@ -890,14 +1353,39 @@ def compute_composite_signal(
         signals["ev_ebitda"] = {"score": 0.0, "note": "insufficient data"}
 
     # ── Composite score (quality-adjusted weights) ────────
+    platform_score = 0.0
+    platform_upside_pct = np.nan
+    if is_platform_model:
+        platform_upside_pct = _safe_float(platform_val.get("base_upside_pct"), np.nan)
+        if not np.isnan(platform_upside_pct):
+            platform_score = float(np.clip(platform_upside_pct / 35.0, -1.0, 1.0))
+        base_case = platform_val.get("scenarios", {}).get("Base", {})
+        signals["platform_eps"] = {
+            "score": round(platform_score, 3),
+            "upside_pct": round(platform_upside_pct, 1) if not np.isnan(platform_upside_pct) else np.nan,
+            "target_price": base_case.get("target_price"),
+            "forward_eps": base_case.get("forward_eps"),
+            "target_multiple": base_case.get("target_multiple"),
+            "eps_growth": base_case.get("eps_growth"),
+            "note": platform_val.get("source_note", ""),
+        }
+
     composite = (w_dcf * dcf_score +
                  w_pe  * pe_score  +
-                 w_ev  * ev_score)
+                 w_ev  * ev_score +
+                 w_platform * platform_score)
+
+    signal_upside_pct = dcf_upside_pct
+    if is_platform_model and not np.isnan(platform_upside_pct):
+        if np.isnan(dcf_upside_pct):
+            signal_upside_pct = platform_upside_pct
+        else:
+            signal_upside_pct = 0.35 * dcf_upside_pct + 0.65 * platform_upside_pct
 
     # ── Quality-gated signal via generate_investment_signal ──
     inv_signal = generate_investment_signal(
         quality_score   = quality_score,
-        dcf_upside_pct  = dcf_upside_pct if not np.isnan(dcf_upside_pct) else 0.0,
+        dcf_upside_pct  = signal_upside_pct if not np.isnan(signal_upside_pct) else 0.0,
         composite_score = composite,
         business_type   = business_type,
     )
@@ -918,13 +1406,16 @@ def compute_composite_signal(
         "signal_color":      signal_color,
         "composite_score":   round(composite, 3),
         "conviction":        conviction,
-        "upside_pct":        round(dcf_upside_pct, 1) if not np.isnan(dcf_upside_pct) else np.nan,
+        "upside_pct":        round(signal_upside_pct, 1) if not np.isnan(signal_upside_pct) else np.nan,
+        "dcf_upside_pct":    round(dcf_upside_pct, 1) if not np.isnan(dcf_upside_pct) else np.nan,
+        "platform_upside_pct": round(platform_upside_pct, 1) if not np.isnan(platform_upside_pct) else np.nan,
         "factor_scores":     signals,
         "quality_score":     quality_score,
         "business_type":     business_type,
         "mos_required":      inv_signal["mos_required"],
         "signal_reason":     inv_signal["reason"],
         "dcf_weight":        w_dcf,
+        "platform_weight":   w_platform,
     }
 
 
@@ -958,7 +1449,11 @@ def run_three_scenarios(data: dict, r: dict, assumptions: dict) -> dict:
         cost_of_debt=assumptions.get("cost_of_debt", 0.09),
         tax_rate=assumptions.get("tax_rate", 0.25),
     )
-    wacc = wacc_result["wacc"]
+    # Use the assumption engine's WACC directly so manual overrides and
+    # Screener-derived WACC are respected by the valuation.
+    wacc = float(assumptions.get("base_wacc", wacc_result["wacc"]))
+    wacc_result["wacc"] = round(wacc, 4)
+    wacc_result["source"] = "assumptions"
 
     scenarios_params = {
         "Bear": {
@@ -1005,15 +1500,60 @@ def run_three_scenarios(data: dict, r: dict, assumptions: dict) -> dict:
         )
         results[name] = {**val, "fcff_df": fcff_df, "assumptions": s}
 
+    # Check if Base scenario produces valid intrinsic value (non-zero and finite)
     base_iv = results["Base"]["intrinsic_per_share"]
+    
+    # FALLBACK: If Base scenario produces zero/invalid IV, use Bull scenario or adjust capex/wc
+    if base_iv is None or (isinstance(base_iv, float) and (base_iv == 0 or np.isnan(base_iv) or np.isinf(base_iv))):
+        # If Bull scenario has valid IV, use it as the base
+        bull_iv = results["Bull"]["intrinsic_per_share"]
+        if bull_iv and isinstance(bull_iv, float) and bull_iv > 0 and not np.isnan(bull_iv):
+            base_iv = bull_iv
+        else:
+            # Otherwise, recalculate with lower capex/wc assumptions (for service companies)
+            # Retry with more conservative capex % (typically lower for financial services)
+            base_params = scenarios_params["Base"]
+            adjusted_capex = min(0.05, base_params["capex_pct_revenue"] * 0.5)
+            adjusted_wc = min(0.02, base_params["wc_change_pct_revenue"] * 0.5)
+            
+            fcff_df_adj = project_fcff(
+                base_revenue=base_revenue or 10000,
+                base_ebitda_margin=base_ebitda_margin,
+                revenue_growth=assumptions.get("base_growth", 0.12),
+                margin_improvement=assumptions.get("base_margin_delta", 0.002),
+                capex_pct_revenue=adjusted_capex,
+                wc_change_pct_revenue=adjusted_wc,
+                tax_rate=assumptions.get("tax_rate", 0.25),
+            )
+            val_adj = dcf_valuation(
+                fcff_df=fcff_df_adj,
+                wacc=wacc,
+                terminal_growth=assumptions.get("base_tgr", 0.04),
+                total_debt=total_debt or 0,
+                cash=cash_val or 0,
+                shares_outstanding=shares,
+            )
+            base_iv = val_adj["intrinsic_per_share"]
+            results["Base"] = {**val_adj, "fcff_df": fcff_df_adj, "assumptions": scenarios_params["Base"]}
 
     # ── Composite signal (quality-aware) ──────────────────
+    platform_valuation = run_exchange_platform_valuation(
+        data=data,
+        r=r,
+        assumptions=assumptions,
+        shares_outstanding=shares,
+        current_price=current_price,
+    )
+    assumptions_for_signal = {**assumptions}
+    if platform_valuation:
+        assumptions_for_signal["platform_valuation"] = platform_valuation
+
     composite = compute_composite_signal(
         current_price=current_price,
         base_iv=base_iv,
         r=r,
         data=data,
-        assumptions=assumptions,
+        assumptions=assumptions_for_signal,
     )
 
     return {
@@ -1032,8 +1572,11 @@ def run_three_scenarios(data: dict, r: dict, assumptions: dict) -> dict:
         "business_type":    composite["business_type"],
         "mos_required":     composite["mos_required"],
         "signal_reason":    composite["signal_reason"],
+        "dcf_weight":        composite["dcf_weight"],
+        "platform_weight":   composite["platform_weight"],
+        "platform_valuation": platform_valuation,
         "shares":           shares,
-        "assumptions_used": assumptions,
+        "assumptions_used": assumptions_for_signal,
     }
 
 
@@ -1058,6 +1601,7 @@ def run_monte_carlo(data: dict, r: dict, assumptions: dict, n_simulations: int =
     base_tgr    = assumptions.get("base_tgr", 0.04)
     base_wacc   = assumptions.get("base_wacc", assumptions.get("wacc", 0.11))
     capex_pct   = assumptions.get("capex_pct", 0.07)
+    wc_pct      = assumptions.get("wc_pct", 0.015)
     tax_rate    = assumptions.get("tax_rate", 0.25)
 
     # Std devs calibrated from historical revenue volatility
@@ -1079,6 +1623,7 @@ def run_monte_carlo(data: dict, r: dict, assumptions: dict, n_simulations: int =
         wacc         = float(np.clip(np.random.normal(base_wacc,   0.015),      0.06,  0.20))
         margin_delta = float(np.random.normal(assumptions.get("base_margin_delta", 0.002), 0.003))
         cap_pct      = float(np.clip(np.random.normal(capex_pct, 0.01), 0.02, 0.20))
+        wc_change    = float(np.clip(np.random.normal(wc_pct, 0.005), 0.0, 0.08))
 
         try:
             fcff_df = project_fcff(
@@ -1087,7 +1632,7 @@ def run_monte_carlo(data: dict, r: dict, assumptions: dict, n_simulations: int =
                 revenue_growth=rev_growth,
                 margin_improvement=margin_delta,
                 capex_pct_revenue=cap_pct,
-                wc_change_pct_revenue=0.015,
+                wc_change_pct_revenue=wc_change,
                 tax_rate=tax_rate,
             )
             val = dcf_valuation(fcff_df, wacc, tgr, total_debt, cash_val, shares)
@@ -1101,6 +1646,16 @@ def run_monte_carlo(data: dict, r: dict, assumptions: dict, n_simulations: int =
         return {"error": "Monte Carlo failed — insufficient data"}
 
     arr = np.array(intrinsic_values)
+    prob_undervalued = float((arr > current_price).mean() * 100)
+    median_upside = ((float(np.median(arr)) - current_price) / current_price * 100
+                     if current_price else np.nan)
+    if prob_undervalued >= 70 and median_upside >= 20:
+        mc_signal = "BUY"
+    elif prob_undervalued <= 30 and median_upside <= -10:
+        mc_signal = "SELL"
+    else:
+        mc_signal = "HOLD"
+
     return {
         "values":           arr.tolist(),
         "mean":             round(float(arr.mean()), 2),
@@ -1112,7 +1667,9 @@ def run_monte_carlo(data: dict, r: dict, assumptions: dict, n_simulations: int =
         "std":              round(float(arr.std()), 2),
         "n_simulations":    len(arr),
         "current_price":    current_price,
-        "prob_undervalued": round(float((arr > current_price).mean() * 100), 1),
+        "prob_undervalued": round(prob_undervalued, 1),
+        "median_upside_pct": round(float(median_upside), 1) if not np.isnan(median_upside) else np.nan,
+        "mc_signal":        mc_signal,
     }
 
 
@@ -1137,6 +1694,7 @@ def run_sensitivity(data: dict, r: dict, assumptions: dict) -> pd.DataFrame:
     base_growth = assumptions.get("base_growth", 0.12)
     base_tgr    = assumptions.get("base_tgr", 0.04)
     capex_pct   = assumptions.get("capex_pct", 0.07)
+    wc_pct      = assumptions.get("wc_pct", 0.015)
     tax_rate    = assumptions.get("tax_rate", 0.25)
 
     def compute_iv(rev_growth, wacc, tgr, cap_pct, margin_delta=0.002):
@@ -1147,7 +1705,7 @@ def run_sensitivity(data: dict, r: dict, assumptions: dict) -> pd.DataFrame:
                 revenue_growth=rev_growth,
                 margin_improvement=margin_delta,
                 capex_pct_revenue=cap_pct,
-                wc_change_pct_revenue=0.015,
+                wc_change_pct_revenue=wc_pct,
                 tax_rate=tax_rate,
             )
             val = dcf_valuation(fcff_df, wacc, tgr, total_debt, cash_val, shares)

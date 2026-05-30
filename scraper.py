@@ -21,10 +21,81 @@ HEADERS = {
 }
 
 
+def _dedupe_columns(cols: list, fallback_prefix: str = "Col") -> list:
+    """Return non-empty, unique column labels for Streamlit-safe DataFrames."""
+    out = []
+    seen = {}
+    for idx, col in enumerate(cols):
+        label = str(col).strip()
+        if not label:
+            label = f"{fallback_prefix} {idx + 1}"
+        if label in seen:
+            seen[label] += 1
+            label = f"{label} {seen[label]}"
+        else:
+            seen[label] = 1
+        out.append(label)
+    return out
+
+
+INDEX_TICKERS = {
+    "1001", "1002", "1003", "1004", "1005", "1006",
+    "NIFTY", "CNX500", "CNXIT", "BANKNIFTY", "NIFTYBANK",
+    "SENSEX", "BSESENSEX", "BSE500", "BSE100", "BSE200",
+}
+
+
+FALLBACK_PEERS = {
+    "RELIANCE": ["IOC", "BPCL", "HINDPETRO", "ONGC", "OIL"],
+    "BAJAJHFL": ["LICHSGFIN", "PNBHOUSING", "CANFINHOME", "AAVAS", "HOMEFIRST"],
+    "BSE": ["MCX", "CDSL", "CAMS", "KFINTECH"],
+    "HDFCBANK": ["ICICIBANK", "KOTAKBANK", "AXISBANK", "SBIN", "INDUSINDBK"],
+    "ICICIBANK": ["HDFCBANK", "KOTAKBANK", "AXISBANK", "SBIN", "INDUSINDBK"],
+    "INFY": ["TCS", "HCLTECH", "WIPRO", "TECHM", "LTIM"],
+    "TCS": ["INFY", "HCLTECH", "WIPRO", "TECHM", "LTIM"],
+}
+
+
+def fallback_peers_for(data: dict) -> list:
+    """Return a conservative fallback peer set when Screener has only indices or no peers."""
+    ticker = str(data.get("ticker", "") or "").upper().strip()
+    if ticker in FALLBACK_PEERS:
+        return [p for p in FALLBACK_PEERS[ticker] if p != ticker]
+
+    text = " ".join(str(data.get(k, "") or "") for k in ("company_name", "sector", "industry", "about")).lower()
+    if "housing finance" in text or "home loan" in text:
+        peers = FALLBACK_PEERS["BAJAJHFL"]
+    elif "bank" in text:
+        peers = FALLBACK_PEERS["HDFCBANK"]
+    elif "information technology" in text or "software" in text or "it services" in text:
+        peers = FALLBACK_PEERS["INFY"]
+    elif "oil" in text or "refinery" in text or "petrochemical" in text:
+        peers = FALLBACK_PEERS["RELIANCE"]
+    elif "exchange" in text or "capital market" in text or "depository" in text:
+        peers = FALLBACK_PEERS["BSE"]
+    else:
+        peers = []
+    return [p for p in peers if p != ticker and not is_index_or_benchmark(p)]
+
+
+def is_index_or_benchmark(ticker: str, company_name: str = "") -> bool:
+    """Return True for Screener benchmark/index rows, not operating peers."""
+    t = str(ticker or "").upper().strip()
+    name = str(company_name or "").lower()
+    if not t:
+        return True
+    if t in INDEX_TICKERS or t.isdigit():
+        return True
+    index_words = ("sensex", "nifty", "bse 500", "bse 100", "bse 200", "index")
+    return any(word in name for word in index_words)
+
+
 def to_num(val):
     """Safely convert string to float."""
     try:
-        cleaned = str(val).replace(",", "").replace("₹", "").replace("%", "").replace("Cr", "").strip()
+        cleaned = str(val).replace(",", "").replace("₹", "").replace("â‚¹", "")
+        cleaned = cleaned.replace("%", "").replace("Cr", "").strip()
+        cleaned = re.sub(r"[^0-9.\-]", "", cleaned)
         return float(cleaned)
     except:
         return np.nan
@@ -55,7 +126,11 @@ def parse_screener_table(soup, section_id: str) -> pd.DataFrame:
         return pd.DataFrame()
 
     try:
-        df = pd.DataFrame(rows, columns=cols[:len(rows[0])])
+        width = len(rows[0])
+        if len(cols) < width:
+            cols = cols + [f"Col {i + 1}" for i in range(len(cols), width)]
+        cols = _dedupe_columns(cols[:width])
+        df = pd.DataFrame(rows, columns=cols)
         return df
     except Exception:
         return pd.DataFrame()
@@ -143,6 +218,7 @@ def fetch_screener_data(ticker: str) -> dict:
     data["pl"] = parse_screener_table(soup, "profit-loss")
     data["bs"] = parse_screener_table(soup, "balance-sheet")
     data["cf"] = parse_screener_table(soup, "cash-flow")
+    data["quarters"] = parse_screener_table(soup, "quarters")
 
     # ── Shareholding / about ──
     about = soup.find("div", class_="company-profile") or soup.find("section", id="about")
@@ -150,6 +226,13 @@ def fetch_screener_data(ticker: str) -> dict:
         data["about"] = about.get_text(strip=True)[:500]
     else:
         data["about"] = ""
+
+    # ── Additional Screener metrics & ratios ──
+    data["all_ratios"] = _extract_all_ratios(soup)
+    data["growth_table"] = _extract_growth_table(soup)
+    
+    # ── Growth estimates from analyst data (if available) ──
+    data["growth_estimate"] = _extract_growth_estimates(soup)
 
     # ── Peers ──
     data["peers"] = []
@@ -159,9 +242,14 @@ def fetch_screener_data(ticker: str) -> dict:
             m = re.search(r"/company/([A-Z0-9\-&]+)/", a["href"], re.IGNORECASE)
             if m:
                 peer = m.group(1).upper()
-                if peer != ticker and peer not in data["peers"]:
+                peer_name = a.get_text(" ", strip=True)
+                if (peer != ticker and peer not in data["peers"]
+                        and not is_index_or_benchmark(peer, peer_name)):
                     data["peers"].append(peer)
         data["peers"] = data["peers"][:5]
+
+    if not data["peers"]:
+        data["peers"] = fallback_peers_for(data)[:5]
 
     # ── Sector from breadcrumb ──
     breadcrumb = soup.find("div", class_="breadcrumb") or soup.find("nav", class_="breadcrumb")
@@ -173,6 +261,124 @@ def fetch_screener_data(ticker: str) -> dict:
     return data
 
 
+def _extract_all_ratios(soup) -> dict:
+    """
+    Extract all available ratios from Screener.in page.
+    Looks for multiple ratio sections and compiles them.
+    """
+    ratios = {}
+    
+    # Try to find ratio tables/sections
+    ratio_sections = soup.find_all("section")
+    for section in ratio_sections:
+        section_id = section.get("id", "")
+        if "ratio" in section_id.lower() or "metrics" in section_id.lower():
+            table = section.find("table")
+            if table:
+                thead = table.find("thead")
+                tbody = table.find("tbody")
+                if thead and tbody:
+                    for tr in tbody.find_all("tr"):
+                        cells = tr.find_all(["td", "th"])
+                        if len(cells) >= 2:
+                            name = cells[0].get_text(strip=True)
+                            value = to_num(cells[1].get_text(strip=True))
+                            if name and not np.isnan(value):
+                                ratios[name] = value
+    
+    # Also check for metrics in list format (common in Screener.in)
+    metric_lists = soup.find_all("ul", class_=re.compile(r"(metric|ratio|list)", re.I))
+    for ul in metric_lists:
+        for li in ul.find_all("li"):
+            text = li.get_text(strip=True)
+            # Look for patterns like "Metric: Value"
+            if ":" in text:
+                parts = text.split(":", 1)
+                if len(parts) == 2:
+                    name = parts[0].strip()
+                    value = to_num(parts[1])
+                    if name and not np.isnan(value):
+                        ratios[name] = value
+    
+    return ratios
+
+
+def _extract_growth_table(soup) -> dict:
+    """
+    Extract Screener's CAGR summary table.
+
+    Typical rows include Compounded Sales Growth, Compounded Profit Growth,
+    Stock Price CAGR, and Return on Equity.
+    """
+    out = {}
+    labels = (
+        "Compounded Sales Growth",
+        "Compounded Profit Growth",
+        "Stock Price CAGR",
+        "Return on Equity",
+    )
+
+    text_node = soup.find(string=re.compile("Compounded Sales Growth", re.I))
+    table = text_node.find_parent("table") if text_node else None
+    if not table:
+        return out
+
+    current_label = None
+    for tr in table.find_all("tr"):
+        cells = [c.get_text(" ", strip=True) for c in tr.find_all(["th", "td"])]
+        if not cells:
+            continue
+
+        matched_label = next((label for label in labels if label.lower() in cells[0].lower()), None)
+        if matched_label:
+            current_label = matched_label
+            out.setdefault(current_label, {})
+            continue
+
+        if current_label and len(cells) >= 2:
+            period = cells[0].replace(":", "").strip()
+            value = to_num(cells[1])
+            if period and not np.isnan(value):
+                out[current_label][period] = value
+
+    out = {k: v for k, v in out.items() if v}
+
+    return out
+
+
+def _extract_growth_estimates(soup) -> dict:
+    """
+    Extract analyst growth estimates or projections from Screener.in.
+    Looks for EPS growth, revenue growth, and other forward estimates.
+    """
+    estimates = {}
+    
+    # Look for analyst estimates section
+    est_sections = soup.find_all(["section", "div"], attrs={"class": re.compile(r"(estimate|forecast|projection)", re.I)})
+    
+    for section in est_sections:
+        divs = section.find_all("div")
+        for div in divs:
+            text = div.get_text(strip=True)
+            # Look for growth rate mentions
+            if "growth" in text.lower() or "eps" in text.lower():
+                # Try to extract percentage values
+                percentages = re.findall(r'([\d.]+)\s*%', text)
+                if percentages:
+                    estimates["found_growth"] = float(percentages[0]) / 100
+    
+    # If no dedicated section, try to extract from page text
+    if not estimates:
+        # Look in main content for forward guidance or analyst estimates
+        page_text = soup.get_text()
+        if "expected growth" in page_text.lower() or "cagr" in page_text.lower():
+            growth_values = re.findall(r'(?:expected growth|CAGR|projected growth)[\s:]*(\d+(?:\.\d+)?)\s*%', page_text, re.I)
+            if growth_values:
+                estimates["cagr_estimate"] = float(growth_values[0]) / 100
+    
+    return estimates
+
+
 def fetch_peer_data(peers: list, delay: float = 1.5) -> list:
     """
     Fetch key financial data for a list of peer tickers.
@@ -180,9 +386,13 @@ def fetch_peer_data(peers: list, delay: float = 1.5) -> list:
     """
     results = []
     for peer in peers:
+        if is_index_or_benchmark(peer):
+            continue
         try:
             time.sleep(delay)
             d = fetch_screener_data(peer)
+            if is_index_or_benchmark(d.get("ticker"), d.get("company_name")):
+                continue
             results.append(d)
         except Exception as e:
             print(f"Could not fetch peer {peer}: {e}")
@@ -213,9 +423,14 @@ def extract_series(df: pd.DataFrame, patterns: list, n_years: int = 5) -> list:
 def get_year_labels(df: pd.DataFrame, n_years: int = 5) -> list:
     """Extract year column headers from a financial table."""
     if df.empty:
-        return [f"FY{y}" for y in range(20, 25)]
-    cols = list(df.columns[1:])
-    if len(cols) >= n_years:
-        return [str(c) for c in cols[-n_years:]]
-    result = [str(c) for c in cols]
-    return result + [""] * (n_years - len(result))
+        return [f"FY-{i}" for i in range(n_years - 1, -1, -1)]
+
+    cols = [str(c).strip() for c in list(df.columns[1:]) if str(c).strip()]
+    year_like = [c for c in cols if re.search(r"(?:19|20)\d{2}|FY|Mar|Dec|Sep|Jun|TTM", c, re.I)]
+    labels = year_like[-n_years:] if len(year_like) >= n_years else cols[-n_years:]
+
+    if len(labels) < n_years:
+        missing = n_years - len(labels)
+        labels = [f"FY-{i}" for i in range(missing, 0, -1)] + labels
+
+    return _dedupe_columns(labels[-n_years:], fallback_prefix="FY")
