@@ -83,6 +83,13 @@ def fmt(val, suffix="", prefix="", dec=1, na="—"):
     except Exception:
         return na
 
+
+def map_dataframe(df: pd.DataFrame, func):
+    mapper = getattr(df, "map", None)
+    if mapper is not None:
+        return mapper(func)
+    return df.applymap(func)
+
 def chart_hint():
     st.markdown(
         '<div class="chart-tip">💡 <em>Click ⛶ for fullscreen &nbsp;|&nbsp; '
@@ -1134,7 +1141,7 @@ with tab_fin:
             "PAT":     r.get("pat",[]),
             "EPS (₹)": r.get("eps",[]),
         }, index=years).T
-        fin_df = fin_df.applymap(
+        fin_df = map_dataframe(fin_df,
             lambda v: f"{float(v):,.1f}" if v is not None and not np.isnan(float(v)) else "—")
         st.dataframe(fin_df, use_container_width=True)
     except Exception as e:
@@ -1201,7 +1208,7 @@ with tab_rat:
             "Payable Days":       r.get("payable_days",[]),
             "Cash Conversion":    r.get("cash_conversion",[]),
         }, index=years).T
-        ratio_df = ratio_df.applymap(
+        ratio_df = map_dataframe(ratio_df,
             lambda v: f"{float(v):,.2f}" if v is not None and not np.isnan(float(v)) else "—")
         st.dataframe(ratio_df, use_container_width=True, height=420)
     except Exception as e:
@@ -1233,8 +1240,8 @@ with tab_cf:
             "CFF (₹ Cr)":r.get("cff",[]),"FCF (₹ Cr)":r.get("fcf",[]),
             "PAT (₹ Cr)":r.get("pat",[]),"CFO / PAT":cfo_pat,
         }, index=years).T
-        cf_df = cf_df.applymap(lambda v: v if isinstance(v,str)
-                               else (f"{float(v):,.0f}" if v is not None and not np.isnan(float(v)) else "—"))
+        cf_df = map_dataframe(cf_df, lambda v: v if isinstance(v,str)
+                              else (f"{float(v):,.0f}" if v is not None and not np.isnan(float(v)) else "—"))
         st.dataframe(cf_df, use_container_width=True)
     except Exception as e:
         st.warning(f"Could not build CF table: {e}")
@@ -1417,7 +1424,7 @@ with tab_dupont:
             "Equity Multiplier (×)": r.get("dupont_equity_mult",[]),
             "DuPont ROE %":          r.get("dupont_roe",[]),
         }, index=years).T
-        du_df = du_df.applymap(
+        du_df = map_dataframe(du_df,
             lambda v: f"{float(v):,.2f}" if v is not None and not np.isnan(float(v)) else "—")
         st.dataframe(du_df, use_container_width=True)
     except Exception as e:
