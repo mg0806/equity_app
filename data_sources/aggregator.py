@@ -6,6 +6,8 @@ import pandas as pd
 from .exchange_source import fetch_exchange_events
 from .screener_source import fetch_fundamentals, fetch_peers
 from .yahoo_source import fetch_market_data
+from scraper import normalize_ticker
+from snapshot_store import SnapshotStore
 
 
 def _safe_float(value, default=np.nan):
@@ -98,6 +100,39 @@ def _merge_exchange_events(data: dict, events: dict) -> dict:
     return data
 
 
+def _snapshot_fallback(ticker: str, error: Exception) -> dict:
+    store = None
+    canonical = normalize_ticker(ticker)
+    try:
+        store = SnapshotStore()
+        snapshot = store.latest_snapshot(canonical)
+    except Exception:
+        snapshot = None
+    finally:
+        if store is not None:
+            try:
+                store.close()
+            except Exception:
+                pass
+
+    if not snapshot:
+        raise error
+
+    data = dict(snapshot.get("data") or {})
+    data.setdefault("ticker", canonical)
+    data.setdefault("company_name", snapshot.get("company_name") or canonical)
+    data.setdefault("sources", {})
+    data.setdefault("source_status", {})
+    data.setdefault("data_quality_notes", [])
+    data["sources"]["financials"] = f"Saved snapshot ({snapshot.get('snapshot_date')})"
+    data["sources"]["fundamentals"] = f"Saved snapshot ({snapshot.get('snapshot_date')})"
+    data["source_status"]["Screener.in"] = f"unavailable, using saved snapshot: {error}"
+    data["data_quality_notes"].append(
+        "Live Screener.in was unavailable; report uses the latest saved fundamentals snapshot."
+    )
+    return data
+
+
 def fetch_company_data(ticker: str, include_market: bool = True, include_exchange_events: bool = True) -> dict:
     """
     Canonical data fetch used by the app.
@@ -107,9 +142,20 @@ def fetch_company_data(ticker: str, include_market: bool = True, include_exchang
     public NSE/BSE endpoints add corporate actions and announcements when
     available.
     """
-    data = fetch_fundamentals(ticker)
+    requested_ticker = str(ticker or "").upper().strip()
+    ticker = normalize_ticker(requested_ticker)
+    try:
+        data = fetch_fundamentals(ticker)
+    except Exception as exc:
+        data = _snapshot_fallback(ticker, exc)
+    if requested_ticker and requested_ticker != ticker:
+        data["requested_ticker"] = requested_ticker
     data.setdefault("sources", {})
     data.setdefault("data_quality_notes", [])
+    if requested_ticker and requested_ticker != ticker:
+        note = f"Input ticker {requested_ticker} was mapped to active symbol {ticker}."
+        if note not in data["data_quality_notes"]:
+            data["data_quality_notes"].append(note)
     data["sources"].setdefault("financials", "Screener.in")
     data["sources"].setdefault("fundamentals", "Screener.in")
     data["sources"].setdefault("top_ratios", "Screener.in")

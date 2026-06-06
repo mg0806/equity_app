@@ -4,11 +4,14 @@ Parses P&L, Balance Sheet, Cash Flow, top ratios, and peer tickers.
 """
 
 import requests
+from pathlib import Path
 from bs4 import BeautifulSoup
 import pandas as pd
 import numpy as np
 import re
 import time
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 HEADERS = {
     "User-Agent": (
@@ -19,6 +22,60 @@ HEADERS = {
     "Accept-Language": "en-US,en;q=0.9",
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
 }
+
+SCREENER_CACHE_DIR = Path(".cache") / "equity_app" / "screener"
+LEGACY_TICKER_ALIASES = {
+    # HDFC Ltd merged into HDFC Bank; keep the app on the active NSE/Screener symbol.
+    "HDFC": "HDFCBANK",
+}
+
+
+def normalize_ticker(ticker: str) -> str:
+    """Return the canonical active ticker used by the data adapters."""
+    cleaned = str(ticker or "").upper().strip()
+    return LEGACY_TICKER_ALIASES.get(cleaned, cleaned)
+
+
+def _screener_session() -> requests.Session:
+    session = requests.Session()
+    retry = Retry(
+        total=3,
+        connect=3,
+        read=3,
+        status=3,
+        backoff_factor=0.8,
+        status_forcelist=(429, 500, 502, 503, 504),
+        allowed_methods=frozenset(["GET"]),
+        raise_on_status=False,
+    )
+    adapter = HTTPAdapter(max_retries=retry)
+    session.mount("https://", adapter)
+    session.mount("http://", adapter)
+    return session
+
+
+def _cache_path(ticker: str, suffix: str) -> Path:
+    page = "consolidated" if suffix == "/consolidated/" else "standalone"
+    return SCREENER_CACHE_DIR / f"{ticker}_{page}.html"
+
+
+def _read_cached_html(ticker: str):
+    for suffix in ("/consolidated/", "/"):
+        path = _cache_path(ticker, suffix)
+        if path.exists():
+            try:
+                return path.read_text(encoding="utf-8"), f"https://www.screener.in/company/{ticker}{suffix}"
+            except OSError:
+                continue
+    return None, None
+
+
+def _write_cached_html(ticker: str, suffix: str, html: str) -> None:
+    try:
+        SCREENER_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        _cache_path(ticker, suffix).write_text(html, encoding="utf-8")
+    except OSError:
+        pass
 
 
 def _dedupe_columns(cols: list, fallback_prefix: str = "Col") -> list:
@@ -141,25 +198,48 @@ def fetch_screener_data(ticker: str) -> dict:
     Main function: scrape all financial data for an NSE ticker from Screener.in.
     Returns a dict with company info, financial tables, and peer list.
     """
-    ticker = ticker.upper().strip()
-    session = requests.Session()
+    requested_ticker = str(ticker or "").upper().strip()
+    ticker = normalize_ticker(requested_ticker)
+    session = _screener_session()
 
     # Try consolidated first, then standalone
+    last_error = None
+    last_status = None
+    resp = None
+    url = None
     for suffix in ["/consolidated/", "/"]:
         url = f"https://www.screener.in/company/{ticker}{suffix}"
         try:
             resp = session.get(url, headers=HEADERS, timeout=30)
+            last_status = resp.status_code
             if resp.status_code == 200:
+                _write_cached_html(ticker, suffix, resp.text)
                 break
+            last_error = f"HTTP {resp.status_code}"
         except requests.RequestException as e:
-            raise ConnectionError(f"Could not connect to Screener.in: {e}")
+            last_error = str(e)
     else:
-        raise ValueError(f"Ticker '{ticker}' not found on Screener.in. Check the symbol.")
+        cached_html, cached_url = _read_cached_html(ticker)
+        if cached_html:
+            resp = None
+            url = cached_url
+        elif last_status == 404:
+            raise ValueError(f"Ticker '{ticker}' not found on Screener.in. Check the symbol.")
+        elif last_error:
+            raise ConnectionError(
+                "Screener.in is temporarily unreachable from this app host. "
+                "Please try again in a few minutes or use a saved snapshot. "
+                f"Last error: {last_error}"
+            )
+        else:
+            raise ValueError(f"Ticker '{ticker}' not found on Screener.in. Check the symbol.")
 
-    soup = BeautifulSoup(resp.text, "lxml")
+    html = cached_html if "cached_html" in locals() and cached_html else resp.text
+    soup = BeautifulSoup(html, "lxml")
 
     data = {
         "ticker": ticker,
+        "requested_ticker": requested_ticker,
         "url": url,
         "company_name": ticker,
         "current_price": None,
@@ -257,6 +337,16 @@ def fetch_screener_data(ticker: str) -> dict:
         links = breadcrumb.find_all("a")
         if len(links) >= 2:
             data["sector"] = links[-1].get_text(strip=True)
+
+    if requested_ticker and requested_ticker != ticker:
+        data.setdefault("data_quality_notes", []).append(
+            f"Input ticker {requested_ticker} was mapped to active symbol {ticker}."
+        )
+    if "cached_html" in locals() and cached_html:
+        data.setdefault("source_status", {})["Screener.in"] = "cached"
+        data.setdefault("data_quality_notes", []).append(
+            "Live Screener.in was unavailable; used the latest cached Screener page."
+        )
 
     return data
 

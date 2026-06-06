@@ -49,7 +49,7 @@ section[data-testid="stSidebar"] { background-color: #0D1424; border-right: 1px 
 </style>
 """, unsafe_allow_html=True)
 
-from scraper import is_index_or_benchmark, fallback_peers_for
+from scraper import is_index_or_benchmark, fallback_peers_for, normalize_ticker
 from data_sources import fetch_company_data, fetch_peer_data_multi_source
 from ratios import calculate_ratios, build_peer_comparison, last_valid
 from red_flags import detect_red_flags, flags_summary
@@ -610,7 +610,8 @@ if not generate_btn and st.session_state["report_data"] is None:
 # GENERATION BLOCK — runs only when button pressed
 # ═══════════════════════════════════════════════════
 if generate_btn and ticker_input:
-    ticker = ticker_input
+    requested_ticker = ticker_input
+    ticker = normalize_ticker(ticker_input)
     prog   = st.progress(0, text="Starting...")
     stat   = st.empty()
 
@@ -620,6 +621,8 @@ if generate_btn and ticker_input:
                       unsafe_allow_html=True)
 
     try:
+        if requested_ticker != ticker:
+            st.info(f"Using active symbol **{ticker}** for **{requested_ticker}**.")
         upd(10, f"Fetching {ticker} from Screener.in + Yahoo Finance + NSE/BSE events...")
         data = fetch_company_data(ticker, include_market=True)
 
