@@ -187,6 +187,7 @@ def export_excel(ticker: str, data: dict, r: dict, flags: list,
     if market_ready:
         target = market_ready.get("target", {})
         risk = market_ready.get("risk", {})
+        risk_case = market_ready.get("risk_case", {})
         conf = market_ready.get("confidence", {})
         dq = market_ready.get("data_quality", {})
         tech = market_ready.get("technical", {})
@@ -195,6 +196,11 @@ def export_excel(ticker: str, data: dict, r: dict, flags: list,
             ("MARKET-READY DECISION", None),
             ("Blended Target Price", target.get("target_price")),
             ("Blended Target Upside %", target.get("upside_pct")),
+            ("Fundamental Rating", target.get("rating")),
+            ("Target Horizon", target.get("horizon")),
+            ("Risk Case Price", risk_case.get("risk_price")),
+            ("Risk Case Downside %", risk_case.get("downside_pct")),
+            ("Risk/Reward Ratio", risk_case.get("risk_reward_ratio")),
             ("Signal Confidence", conf.get("score")),
             ("Confidence Rating", conf.get("rating")),
             ("Risk Score", risk.get("score")),
@@ -403,6 +409,7 @@ def export_excel(ticker: str, data: dict, r: dict, flags: list,
     if market_ready:
         target = market_ready.get("target", {})
         risk = market_ready.get("risk", {})
+        risk_case = market_ready.get("risk_case", {})
         conf = market_ready.get("confidence", {})
         dq = market_ready.get("data_quality", {})
         tech = market_ready.get("technical", {})
@@ -413,6 +420,13 @@ def export_excel(ticker: str, data: dict, r: dict, flags: list,
             ("Final Signal", dcf_result.get("signal") if dcf_result else None),
             ("Blended Target Price", target.get("target_price")),
             ("Blended Target Upside %", target.get("upside_pct")),
+            ("Fundamental Rating", target.get("rating")),
+            ("Target Horizon", target.get("horizon")),
+            ("Target Methodology", target.get("methodology")),
+            ("Risk Case Price", risk_case.get("risk_price")),
+            ("Risk Case Downside %", risk_case.get("downside_pct")),
+            ("Risk/Reward Ratio", risk_case.get("risk_reward_ratio")),
+            ("Risk Haircut %", risk_case.get("haircut_pct")),
             ("Signal Confidence Score", conf.get("score")),
             ("Signal Confidence Rating", conf.get("rating")),
             ("Risk Score", risk.get("score")),
@@ -437,12 +451,26 @@ def export_excel(ticker: str, data: dict, r: dict, flags: list,
         else:
             _write_df(ws_target, pd.DataFrame([{"Message": "Target bridge unavailable"}]))
 
+        ws_risk_case = wb.create_sheet("Risk Case Price")
+        risk_components = risk_case.get("components")
+        if risk_components is not None and not risk_components.empty:
+            _write_df(ws_risk_case, risk_components)
+        else:
+            _write_df(ws_risk_case, pd.DataFrame([{"Message": risk_case.get("note", "Risk case unavailable")}]))
+
         ws_forecast = wb.create_sheet("Forecasts")
         forecast = market_ready.get("forecast")
         if forecast is not None and not forecast.empty:
             _write_df(ws_forecast, forecast)
         else:
             _write_df(ws_forecast, pd.DataFrame([{"Message": "Forecast unavailable"}]))
+
+        ws_triggers = wb.create_sheet("Sector Triggers")
+        trigger_table = (market_ready.get("trigger_review") or {}).get("table")
+        if trigger_table is not None and not trigger_table.empty:
+            _write_df(ws_triggers, trigger_table)
+        else:
+            _write_df(ws_triggers, pd.DataFrame([{"Message": "Sector trigger review unavailable"}]))
 
         ws_risk = wb.create_sheet("Risk Confidence")
         risk_rows = []

@@ -394,6 +394,7 @@ def generate_pdf(ticker: str, data: dict, r: dict, flags: list,
 
         target = market_ready.get("target", {})
         risk = market_ready.get("risk", {})
+        risk_case = market_ready.get("risk_case", {})
         conf = market_ready.get("confidence", {})
         dq = market_ready.get("data_quality", {})
         tech = market_ready.get("technical", {})
@@ -405,11 +406,15 @@ def generate_pdf(ticker: str, data: dict, r: dict, flags: list,
         momentum = market_ready.get("momentum", {})
         reliability = market_ready.get("source_reliability", {})
         sector_val = market_ready.get("sector_valuation", {})
+        trigger_review = market_ready.get("trigger_review", {})
         signal = dcf_result.get("signal", "N/A") if dcf_result else "N/A"
 
         decision_rows = [
-            ["Final Signal", signal, "Blended Target", _fmt(target.get("target_price"), prefix="₹", decimals=0)],
-            ["Target Upside", _fmt(target.get("upside_pct"), "%"), "Signal Confidence", f"{_fmt(conf.get('score'), decimals=0)} / 100 ({conf.get('rating','N/A')})"],
+            ["Fundamental Rating", target.get("rating", signal), "Blended Target", _fmt(target.get("target_price"), prefix="₹", decimals=0)],
+            ["Target Upside", _fmt(target.get("upside_pct"), "%"), "Horizon", target.get("horizon", "2 years")],
+            ["Signal Confidence", f"{_fmt(conf.get('score'), decimals=0)} / 100 ({conf.get('rating','N/A')})", "DCF Signal", signal],
+            ["Risk Case Price", _fmt(risk_case.get("risk_price"), prefix="₹", decimals=0), "If Risk Hits", _fmt(risk_case.get("downside_pct"), "%")],
+            ["Risk/Reward", _fmt(risk_case.get("risk_reward_ratio"), "x", decimals=2), "Risk Haircut", _fmt(risk_case.get("haircut_pct"), "%")],
             ["Risk Score", f"{_fmt(risk.get('score'), decimals=0)} / 100 ({risk.get('rating','N/A')})", "Data Quality", f"{_fmt(dq.get('score'), decimals=0)} / 100 ({dq.get('rating','N/A')})"],
             ["52W Position", _fmt(tech.get("position_52w_pct"), "%"), "1Y Return / Vol", f"{_fmt(tech.get('return_1y_pct'), '%')} / {_fmt(tech.get('volatility_1y_pct'), '%')}"],
             ["Beta vs Nifty", _fmt(tech.get("beta_vs_nifty"), "x", decimals=2), "Backtest Readiness", backtest.get("status", "N/A")],
@@ -428,11 +433,43 @@ def generate_pdf(ticker: str, data: dict, r: dict, flags: list,
                     _safe_text(row.get("Model"), 24),
                     _fmt(row.get("Target"), prefix="₹", decimals=0),
                     _fmt(row.get("Weight %"), "%"),
-                    _safe_text(row.get("Note"), 75),
+                    _safe_text((str(row.get("Method", "")) + ": " + str(row.get("Note", ""))).strip(": "), 75),
                 ])
             story.append(_small_table(rows, [32*mm, 30*mm, 24*mm, 95*mm]))
         else:
             story.append(Paragraph("Target bridge unavailable due to incomplete valuation inputs.", body_s))
+        story.append(Spacer(1, 6))
+
+        story.append(Paragraph("Risk Case Price Bridge", sec_s))
+        risk_components = risk_case.get("components")
+        if risk_components is not None and not risk_components.empty:
+            rows = [["Input", "Price", "Weight %", "Rationale"]]
+            for _, row in risk_components.iterrows():
+                rows.append([
+                    _safe_text(row.get("Scenario Input"), 24),
+                    _fmt(row.get("Price"), prefix="₹", decimals=0),
+                    _fmt(row.get("Weight %"), "%"),
+                    _safe_text(row.get("Note"), 75),
+                ])
+            story.append(_small_table(rows, [32*mm, 30*mm, 24*mm, 95*mm]))
+        else:
+            story.append(Paragraph(risk_case.get("note", "Risk case unavailable."), body_s))
+        story.append(Spacer(1, 6))
+
+        story.append(Paragraph("Earnings, Sector & Macro Triggers", sec_s))
+        trigger_table = trigger_review.get("table")
+        if trigger_table is not None and not trigger_table.empty:
+            rows = [["Area", "Metric", "Value", "Note"]]
+            for _, row in trigger_table.head(8).iterrows():
+                rows.append([
+                    _safe_text(row.get("Area"), 22),
+                    _safe_text(row.get("Metric"), 26),
+                    _safe_text(row.get("Value"), 20),
+                    _safe_text(row.get("Note"), 75),
+                ])
+            story.append(_small_table(rows, [30*mm, 34*mm, 24*mm, 93*mm]))
+        else:
+            story.append(Paragraph("Trigger review unavailable.", body_s))
         story.append(Spacer(1, 6))
 
         story.append(Paragraph("Forward Financial Forecast", sec_s))

@@ -372,15 +372,63 @@ def sector_specific_valuation(data, r, assumptions, dcf_result=None, forecast=No
     }
 
 
-def blended_target_price(data, r, dcf_result, peer_df=None, sector_valuation=None):
-    """Blend DCF, relative valuation, and sector/platform models into one target."""
+def dividend_discount_valuation(data, r, assumptions=None, dcf_result=None):
+    """Dividend discount model for banks, financials and steady dividend payers."""
+    price = _safe_float(data.get("current_price"), np.nan)
+    dividend_yield = _safe_float(data.get("dividend_yield"), np.nan)
+    eps_growth = _safe_float(r.get("eps_cagr_3y"), _safe_float(r.get("pat_cagr_3y"), 6))
+    business_type = (assumptions or {}).get("business_type", "")
+    sector_model = _classify_sector(data, assumptions)
+
+    if np.isnan(price) or price <= 0 or np.isnan(dividend_yield) or dividend_yield <= 0:
+        return {"target_price": np.nan, "upside_pct": np.nan, "drivers": ["Dividend data unavailable"]}
+
+    dps = price * dividend_yield / 100
+    growth = float(np.clip((eps_growth if not np.isnan(eps_growth) else 6) / 100, 0.02, 0.08))
+    wacc = _safe_float(((dcf_result or {}).get("wacc_result") or {}).get("cost_of_equity"), np.nan)
+    if np.isnan(wacc):
+        wacc = _safe_float((assumptions or {}).get("base_wacc"), 0.11)
+
+    if wacc <= growth + 0.025:
+        wacc = growth + 0.035
+
+    target = dps * (1 + growth) / (wacc - growth)
+    if business_type not in ("stable", "high-margin-stable") and sector_model not in ("Banks/NBFCs", "Insurance/AMC"):
+        target *= 0.85
+
+    upside = (target - price) / price * 100
+    return {
+        "target_price": round(float(target), 2),
+        "upside_pct": round(float(upside), 1),
+        "drivers": [
+            f"DPS proxy ₹{dps:.2f} from dividend yield {dividend_yield:.1f}%",
+            f"Dividend growth {growth * 100:.1f}%, cost of equity {wacc * 100:.1f}%",
+        ],
+    }
+
+
+def _target_rating(upside_pct):
+    upside = _safe_float(upside_pct, np.nan)
+    if np.isnan(upside):
+        return "N/A"
+    if upside >= 15:
+        return "BUY"
+    if upside >= -5:
+        return "HOLD"
+    if upside >= -15:
+        return "REDUCE"
+    return "SELL"
+
+
+def blended_target_price(data, r, dcf_result, peer_df=None, sector_valuation=None, forecast=None, assumptions=None):
+    """Blend DCF, relative valuation, DDM, and earnings-based models into a 2Y target."""
     current_price = _safe_float(data.get("current_price"), np.nan)
     pieces = []
 
-    def add(name, value, weight, note):
+    def add(name, value, weight, note, method="Fundamental"):
         value = _safe_float(value, np.nan)
         if not np.isnan(value) and value > 0 and weight > 0:
-            pieces.append({"Model": name, "Target": value, "Weight": weight, "Note": note})
+            pieces.append({"Model": name, "Method": method, "Target": value, "Weight": weight, "Note": note})
 
     if sector_valuation:
         add(
@@ -388,34 +436,50 @@ def blended_target_price(data, r, dcf_result, peer_df=None, sector_valuation=Non
             sector_valuation.get("target_price"),
             0.30,
             "; ".join(sector_valuation.get("drivers", [])[:2]),
+            "Sector valuation",
         )
 
     if dcf_result:
-        add("DCF Base", dcf_result.get("base_iv"), 0.25, "FCFF intrinsic value")
+        add("DCF Base", dcf_result.get("base_iv"), 0.25, "FCFF intrinsic value discounted by WACC", "DCF")
         platform = dcf_result.get("platform_valuation", {})
         if platform:
-            add("Platform EPS", platform.get("base_target"), 0.30, "FY+2 EPS multiple model")
+            add("Platform EPS", platform.get("base_target"), 0.30, "FY+2 EPS multiple model", "Earnings estimate")
 
     eps = _safe_float(last_valid(r.get("eps", [])), np.nan)
     eps_growth = _safe_float(r.get("eps_cagr_3y"), np.nan)
+    fy2_eps = np.nan
+    if forecast is not None and not getattr(forecast, "empty", True) and "EPS" in forecast.columns:
+        fy2 = forecast[forecast["Year"].astype(str).str.upper().eq("FY+2")]
+        if not fy2.empty:
+            fy2_eps = _safe_float(fy2["EPS"].iloc[0], np.nan)
+
     if not np.isnan(eps) and eps > 0:
         fair_pe = np.clip((eps_growth if not np.isnan(eps_growth) else 12) * 1.2, 8, 45)
-        add("Fair P/E", eps * fair_pe, 0.16, f"EPS x {fair_pe:.1f} fair P/E")
+        add("Fair P/E", eps * fair_pe, 0.14, f"Latest EPS x {fair_pe:.1f} fair P/E", "Relative valuation")
+        if not np.isnan(fy2_eps) and fy2_eps > 0:
+            add("FY+2 EPS Target", fy2_eps * fair_pe, 0.18, f"FY+2 EPS x {fair_pe:.1f} fair P/E", "Earnings estimate")
 
     book_value = _safe_float(data.get("book_value"), np.nan)
     roe = _safe_float(last_valid(r.get("roe", [])), np.nan)
     if not np.isnan(book_value) and book_value > 0:
         fair_pb = np.clip((roe if not np.isnan(roe) else 12) / 8, 0.8, 8.0)
-        add("Fair P/B", book_value * fair_pb, 0.09, f"BV x {fair_pb:.1f} fair P/B")
+        add("Fair P/B", book_value * fair_pb, 0.09, f"BV x {fair_pb:.1f} fair P/B", "Relative valuation")
 
     if peer_df is not None and "P/E" in peer_df.columns and not np.isnan(eps):
         peers = peer_df[peer_df.get("_is_target") == False] if "_is_target" in peer_df.columns else peer_df
         peer_pe = pd.to_numeric(peers.get("P/E"), errors="coerce").replace([np.inf, -np.inf], np.nan).dropna()
         if not peer_pe.empty:
-            add("Peer P/E", eps * float(peer_pe.median()), 0.12, "Peer median P/E")
+            add("Peer P/E", eps * float(peer_pe.median()), 0.12, "Peer median P/E", "Peer valuation")
+
+    ddm = dividend_discount_valuation(data, r, assumptions, dcf_result)
+    ddm_target = _safe_float(ddm.get("target_price"), np.nan)
+    sector_model = (sector_valuation or {}).get("sector_model") or _classify_sector(data, assumptions)
+    if not np.isnan(ddm_target):
+        ddm_weight = 0.14 if sector_model in ("Banks/NBFCs", "Insurance/AMC") else 0.07
+        add("Dividend Discount", ddm_target, ddm_weight, "; ".join(ddm.get("drivers", [])[:2]), "DDM")
 
     if not pieces:
-        return {"target_price": np.nan, "upside_pct": np.nan, "components": pd.DataFrame()}
+        return {"target_price": np.nan, "upside_pct": np.nan, "rating": "N/A", "horizon": "2 years", "components": pd.DataFrame()}
 
     total_weight = sum(p["Weight"] for p in pieces)
     target = sum(p["Target"] * p["Weight"] for p in pieces) / total_weight
@@ -427,7 +491,125 @@ def blended_target_price(data, r, dcf_result, peer_df=None, sector_valuation=Non
     return {
         "target_price": round(float(target), 2),
         "upside_pct": round(float(upside), 1) if not np.isnan(upside) else np.nan,
+        "rating": _target_rating(upside),
+        "horizon": "2 years",
+        "methodology": "ICICI-style blend: DCF, relative valuation, DDM when useful, FY+2 earnings and sector model",
         "components": comp,
+    }
+
+
+def risk_price_scenario(data, dcf_result=None, mc_result=None, target=None, risk=None):
+    """
+    Estimate the price if key risks materialise.
+
+    This is a downside scenario, not a stop-loss or recommendation. It blends
+    model bear cases with market support and a risk-score haircut so the app can
+    show a practical target-vs-risk price range.
+    """
+    current_price = _safe_float(data.get("current_price"), np.nan)
+    risk_score_val = _safe_float((risk or {}).get("score"), 45)
+    risk_haircut = float(np.interp(np.clip(risk_score_val, 0, 100), [0, 40, 65, 100], [0.08, 0.14, 0.24, 0.38]))
+
+    pieces = []
+
+    def add(name, value, weight, note):
+        value = _safe_float(value, np.nan)
+        if not np.isnan(value) and value > 0 and weight > 0:
+            pieces.append({"Scenario Input": name, "Price": value, "Weight": weight, "Note": note})
+
+    if dcf_result:
+        bear = ((dcf_result.get("scenarios") or {}).get("Bear") or {}).get("intrinsic_per_share")
+        add("Bear DCF", bear, 0.40, "DCF valuation under bear growth/margin assumptions")
+
+    if mc_result and not mc_result.get("error"):
+        add("Monte Carlo P10", mc_result.get("p10"), 0.25, "10th percentile intrinsic value from simulations")
+
+    add("52W Low", data.get("low_52w"), 0.15, "Observed downside support from 52-week range")
+
+    if not np.isnan(current_price):
+        add("Risk Haircut", current_price * (1 - risk_haircut), 0.20, f"Current price less {risk_haircut * 100:.0f}% risk-score haircut")
+
+    if not pieces:
+        return {
+            "risk_price": np.nan,
+            "downside_pct": np.nan,
+            "risk_reward_ratio": np.nan,
+            "haircut_pct": np.nan,
+            "components": pd.DataFrame(),
+            "note": "Risk case unavailable because price and downside inputs are incomplete",
+        }
+
+    total_weight = sum(p["Weight"] for p in pieces)
+    risk_price = sum(p["Price"] * p["Weight"] for p in pieces) / total_weight
+    if not np.isnan(current_price) and current_price > 0:
+        downside = (risk_price - current_price) / current_price * 100
+    else:
+        downside = np.nan
+
+    target_price = _safe_float((target or {}).get("target_price"), np.nan)
+    upside_rupees = target_price - current_price if not any(np.isnan(x) for x in [target_price, current_price]) else np.nan
+    downside_rupees = current_price - risk_price if not any(np.isnan(x) for x in [current_price, risk_price]) else np.nan
+    rr = upside_rupees / downside_rupees if downside_rupees and downside_rupees > 0 else np.nan
+
+    comp = pd.DataFrame(pieces)
+    comp["Weight %"] = (comp["Weight"] / total_weight * 100).round(1)
+    comp["Price"] = comp["Price"].round(2)
+
+    return {
+        "risk_price": round(float(risk_price), 2),
+        "downside_pct": round(float(downside), 1) if not np.isnan(downside) else np.nan,
+        "risk_reward_ratio": round(float(rr), 2) if not np.isnan(rr) else np.nan,
+        "haircut_pct": round(float(risk_haircut * 100), 1),
+        "components": comp,
+        "note": "Estimated price if major risk drivers materialise",
+    }
+
+
+def sector_kpi_triggers(data, r, assumptions=None, quarterly=None, revision=None, momentum=None):
+    """Broker-style sector, earnings, technical and macro trigger notes."""
+    sector_model = _classify_sector(data, assumptions)
+    rows = []
+
+    def add(area, metric, value, note):
+        rows.append({"Area": area, "Metric": metric, "Value": value, "Note": note})
+
+    roe = _safe_float(last_valid(r.get("roe", [])), np.nan)
+    roce = _safe_float(last_valid(r.get("roce", [])), np.nan)
+    de = _safe_float(last_valid(r.get("debt_equity", [])), np.nan)
+    eps_growth = _safe_float(r.get("eps_cagr_3y"), np.nan)
+    sales_growth = _safe_float(r.get("revenue_cagr_3y"), np.nan)
+    opm = _safe_float(last_valid(r.get("operating_margin", [])), np.nan)
+
+    if sector_model == "Banks/NBFCs":
+        add("Sector KPI", "ROE", None if np.isnan(roe) else round(roe, 1), "Proxy for profitability; NIM/NPA data not available in current source set")
+        add("Sector KPI", "Book Value", data.get("book_value"), "P/B target depends on book value and sustainable ROE")
+        add("Macro", "Rate sensitivity", "High", "RBI rate cycle, deposit costs, credit growth and asset quality can revise target multiples")
+    elif sector_model in ("IT Services", "FMCG/Consumer"):
+        add("Sector KPI", "Operating Margin %", None if np.isnan(opm) else round(opm, 1), "Margin resilience supports premium earnings multiple")
+        add("Sector KPI", "EPS CAGR 3Y %", None if np.isnan(eps_growth) else round(eps_growth, 1), "FY+2 target is sensitive to earnings estimate changes")
+        add("Macro", "Demand/Currency", "Medium", "Global demand, input costs and currency movement can change the target multiple")
+    elif sector_model == "Metals/Commodity":
+        add("Sector KPI", "ROCE %", None if np.isnan(roce) else round(roce, 1), "Cycle-adjusted returns drive EV/EBITDA comfort")
+        add("Macro", "Commodity cycle", "High", "Commodity prices, China demand, energy costs and regulation can dominate target revisions")
+    else:
+        add("Sector KPI", "Sales CAGR 3Y %", None if np.isnan(sales_growth) else round(sales_growth, 1), "Revenue growth is a primary earnings trigger")
+        add("Sector KPI", "Debt/Equity", None if np.isnan(de) else round(de, 2), "Leverage affects WACC, P/B comfort and risk rating")
+
+    if quarterly:
+        add("Earnings Trigger", "Quarterly trend", quarterly.get("rating", "N/A"), "Target should be reviewed after quarterly result changes")
+        add("Earnings Trigger", "Revenue YoY %", quarterly.get("revenue_yoy_pct"), "Near-term earnings estimate revision input")
+        add("Earnings Trigger", "PAT YoY %", quarterly.get("pat_yoy_pct"), "Profit growth surprise can lift or cut FY+2 EPS target")
+
+    if revision:
+        add("Revision", "Earnings revision", revision.get("rating", "N/A"), "; ".join((revision.get("drivers") or [])[:2]))
+
+    if momentum:
+        add("Technical/Derivative Proxy", "Momentum", momentum.get("rating", "N/A"), "Short-term overlay; may differ from fundamental rating")
+
+    return {
+        "sector_model": sector_model,
+        "table": pd.DataFrame(rows),
+        "notes": [r["Note"] for r in rows[:5]],
     }
 
 
@@ -953,14 +1135,16 @@ def build_market_ready_report(data, r, flags, peer_df, dcf_result, mc_result, as
     quarterly = quarterly_snapshot(data)
     forecast = forecast_financials(data, r, assumptions, quarterly=quarterly)
     sector_val = sector_specific_valuation(data, r, assumptions, dcf_result, forecast, quarterly)
-    target = blended_target_price(data, r, dcf_result, peer_df, sector_val)
     valuation = valuation_bands(data, r)
     revision = earnings_revision_signal(r, quarterly)
     momentum = price_momentum_overlay(data)
+    target = blended_target_price(data, r, dcf_result, peer_df, sector_val, forecast, assumptions)
+    trigger_review = sector_kpi_triggers(data, r, assumptions, quarterly, revision, momentum)
     tech = technical_snapshot(data)
     ranking = peer_ranking(peer_df, data, assumptions)
     reliability = source_reliability_score(data, r, peer_df, assumptions, dq, sector_val)
     risk = risk_score(data, r, flags, assumptions, dq, momentum, revision)
+    risk_case = risk_price_scenario(data, dcf_result, mc_result, target, risk)
     price_bt = historical_price_backtest_proxy(data)
     validation = run_historical_validation(data, r)
     backtest = backtest_readiness(
@@ -980,6 +1164,7 @@ def build_market_ready_report(data, r, flags, peer_df, dcf_result, mc_result, as
         "forecast": forecast,
         "sector_valuation": sector_val,
         "target": target,
+        "trigger_review": trigger_review,
         "valuation_bands": valuation,
         "earnings_revision": revision,
         "momentum": momentum,
@@ -988,6 +1173,7 @@ def build_market_ready_report(data, r, flags, peer_df, dcf_result, mc_result, as
         "source_reliability": reliability,
         "confidence": confidence,
         "risk": risk,
+        "risk_case": risk_case,
         "backtest": backtest,
         "explainability": explain,
     }

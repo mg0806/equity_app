@@ -24,9 +24,11 @@ html, body, [class*="css"] { font-family: 'DM Sans', sans-serif; }
 .stApp { background-color: #0A0F1E; }
 section[data-testid="stSidebar"] { background-color: #0D1424; border-right: 1px solid #1E2A45; }
 [data-testid="metric-container"] { background-color: #111827; border: 1px solid #1E2A45; border-radius: 10px; padding: 16px; }
-.stTabs [data-baseweb="tab-list"] { background-color: #111827; border-radius: 8px; gap: 4px; }
-.stTabs [data-baseweb="tab"] { background-color: transparent; color: #8B9AB5; border-radius: 6px; font-weight: 500; }
-.stTabs [aria-selected="true"] { background-color: #1B4F8A !important; color: white !important; }
+.stTabs [data-baseweb="tab-list"] { background-color:#111827; border-radius:8px; gap:4px; padding:4px; align-items:center; min-height:52px; border-bottom:1px solid #26344F; }
+.stTabs [data-baseweb="tab"] { background-color:transparent; color:#B0BCC8; border-radius:6px; font-weight:500; height:40px; padding:0 10px; display:flex; align-items:center; justify-content:center; white-space:nowrap; margin:0; }
+.stTabs [data-baseweb="tab"] p { margin:0; line-height:1; display:flex; align-items:center; gap:4px; }
+.stTabs [aria-selected="true"] { background-color:#1B4F8A !important; color:white !important; }
+.stTabs [data-baseweb="tab-highlight"] { display:none; }
 .stDownloadButton > button { background-color: #1B4F8A; color: white; border: none; border-radius: 8px; font-weight: 600; padding: 10px 20px; width: 100%; }
 .stDownloadButton > button:hover { background-color: #2563EB; }
 .stButton > button[kind="primary"] { background: linear-gradient(135deg, #1B4F8A, #2563EB); color: white; border: none; border-radius: 10px; font-weight: 700; font-size: 16px; padding: 14px 28px; width: 100%; letter-spacing: 0.5px; box-shadow: 0 4px 20px rgba(27,79,138,0.4); }
@@ -46,6 +48,15 @@ section[data-testid="stSidebar"] { background-color: #0D1424; border-right: 1px 
 .sb-val { color:#7EB8F7; font-weight:600; }
 .sb-source { font-size:9px; color:#4A6A8A; font-style:italic; }
 .quality-bar-bg { background:#1E2A45; border-radius:8px; height:14px; overflow:hidden; margin-top:4px; }
+.metric-grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(135px,1fr)); gap:12px; margin:12px 0; }
+.metric-tile { background:#111827; border:1px solid #1E2A45; border-radius:10px; padding:14px 16px; min-height:86px; }
+.metric-label { color:#B0BCC8; font-size:12px; font-weight:700; margin-bottom:8px; white-space:normal; }
+.metric-value { color:#F8FAFC; font-size:25px; line-height:1.12; font-weight:800; overflow-wrap:anywhere; word-break:normal; }
+.metric-sub { color:#8B9AB5; font-size:11px; line-height:1.35; margin-top:6px; overflow-wrap:anywhere; }
+.metric-accent-blue { border-color:#2563EB66; }
+.metric-accent-green { border-color:#27AE6066; }
+.metric-accent-red { border-color:#E74C3C66; }
+.metric-accent-amber { border-color:#F39C1266; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -61,7 +72,7 @@ from charts import (chart_financial_trend, chart_cashflow_trend, chart_margins,
                     chart_dupont, chart_balance_sheet, chart_dcf_waterfall,
                     chart_scenario_comparison, chart_monte_carlo, chart_tornado,
                     chart_peer_radar)
-from market_ready import build_market_ready_report
+from market_ready import build_market_ready_report, risk_price_scenario
 from snapshot_store import (
     DEFAULT_DB_PATH,
     DEFAULT_MODEL_VERSION,
@@ -112,6 +123,17 @@ def _snapshot_to_report_data(snapshot: dict) -> dict:
     assumptions = snapshot.get("assumptions") or {}
     dcf_result = snapshot.get("dcf_result") or {}
     market_ready = snapshot.get("market_ready") or {}
+    if market_ready and "risk_case" not in market_ready:
+        market_ready["risk_case"] = risk_price_scenario(
+            data,
+            dcf_result,
+            None,
+            market_ready.get("target", {}),
+            market_ready.get("risk", {}),
+        )
+    if market_ready and market_ready.get("target") and "rating" not in market_ready["target"]:
+        market_ready["target"]["rating"] = target_rating_from_upside(market_ready["target"].get("upside_pct"))
+        market_ready["target"]["horizon"] = "2 years"
     flags = detect_red_flags(r)
     flag_summ = flags_summary(flags)
     sens_df = None
@@ -227,6 +249,31 @@ def score_bar_html(score: float, label: str, weight_pct: int) -> str:
         f'<div style="height:10px;width:{pct}%;background:{color};border-radius:6px;"></div>'
         f'</div></div>'
     )
+
+def metric_tile(label: str, value: str, sub: str = "", accent: str = "") -> str:
+    accent_class = f" metric-accent-{accent}" if accent else ""
+    return (
+        f'<div class="metric-tile{accent_class}">'
+        f'<div class="metric-label">{label}</div>'
+        f'<div class="metric-value">{value}</div>'
+        f'<div class="metric-sub">{sub}</div>'
+        f'</div>'
+    )
+
+def target_rating_from_upside(upside_pct):
+    try:
+        upside = float(upside_pct)
+    except Exception:
+        return "N/A"
+    if np.isnan(upside):
+        return "N/A"
+    if upside >= 15:
+        return "BUY"
+    if upside >= -5:
+        return "HOLD"
+    if upside >= -15:
+        return "REDUCE"
+    return "SELL"
 
 def quality_bar_html(score: float, max_score: float, label: str) -> str:
     """Render a filled quality score bar (0 to max_score scale)."""
@@ -789,6 +836,18 @@ final_assumptions = rd["final_assumptions"]
 years             = rd["years"]
 snapshot_meta     = rd.get("snapshot_meta", {})
 
+if market_ready and "risk_case" not in market_ready:
+    market_ready["risk_case"] = risk_price_scenario(
+        data,
+        dcf_result,
+        mc_result,
+        market_ready.get("target", {}),
+        market_ready.get("risk", {}),
+    )
+if market_ready and market_ready.get("target") and "rating" not in market_ready["target"]:
+    market_ready["target"]["rating"] = target_rating_from_upside(market_ready["target"].get("upside_pct"))
+    market_ready["target"]["horizon"] = "2 years"
+
 
 # ── COMPANY HEADER ──
 company   = data.get("company_name", ticker)
@@ -797,6 +856,10 @@ mktcap    = data.get("market_cap")
 price_str = f"₹{price:,.2f}" if price else "—"
 w52_str   = f"52W: {fmt(data.get('low_52w'), prefix='₹', dec=0)} – {fmt(data.get('high_52w'), prefix='₹', dec=0)}"
 sector_str = f" &nbsp;•&nbsp; {data.get('sector','')}" if data.get('sector') else ""
+header_target = (market_ready or {}).get("target", {})
+header_risk = (market_ready or {}).get("risk_case", {})
+header_conf = (market_ready or {}).get("confidence", {})
+header_rating = header_target.get("rating", "N/A")
 
 # Quality + Business type badge for header
 _biz      = final_assumptions.get("business_type", "stable")
@@ -835,18 +898,21 @@ if snapshot_meta:
         f"Sources: {snapshot_meta.get('source_version', SOURCE_VERSION)}"
     )
 
-m1,m2,m3,m4,m5,m6,m7 = st.columns(7)
-for col, label, val in [
-    (m1,"Mkt Cap",   fmt(mktcap, suffix=" Cr", prefix="₹", dec=0)),
-    (m2,"P/E",       fmt(data.get("pe_ratio"), "x")),
-    (m3,"P/B",       fmt(r.get("pb_ratio"), "x", dec=2)),
-    (m4,"EV/EBITDA", fmt(r.get("ev_ebitda"), "x")),
-    (m5,"Div Yield", fmt(data.get("dividend_yield"), "%")),
-    (m6,"ROCE",      fmt(last_valid(r.get("roce",[])), "%")),
-    (m7,"ROE",       fmt(last_valid(r.get("roe",[])), "%")),
-]:
-    with col:
-        st.metric(label, val)
+st.markdown(
+    '<div class="metric-grid">'
+    + metric_tile("Target Price", fmt(header_target.get("target_price"), prefix="₹", dec=0), f'{fmt(header_target.get("upside_pct"), "%")} | {header_rating} | {header_target.get("horizon", "2 years")}', "green")
+    + metric_tile("Risk Case Price", fmt(header_risk.get("risk_price"), prefix="₹", dec=0), fmt(header_risk.get("downside_pct"), "%") + " if risk hits", "red")
+    + metric_tile("Risk/Reward", fmt(header_risk.get("risk_reward_ratio"), "x", dec=2), f"Confidence {header_conf.get('rating', 'N/A')}", "blue")
+    + metric_tile("Mkt Cap", fmt(mktcap, suffix=" Cr", prefix="₹", dec=0))
+    + metric_tile("P/E", fmt(data.get("pe_ratio"), "x"))
+    + metric_tile("P/B", fmt(r.get("pb_ratio"), "x", dec=2))
+    + metric_tile("EV/EBITDA", fmt(r.get("ev_ebitda"), "x"))
+    + metric_tile("Div Yield", fmt(data.get("dividend_yield"), "%"))
+    + metric_tile("ROCE", fmt(last_valid(r.get("roce",[])), "%"))
+    + metric_tile("ROE", fmt(last_valid(r.get("roe",[])), "%"))
+    + '</div>',
+    unsafe_allow_html=True,
+)
 
 src_bits = []
 for label, key in [("Financials", "financials"), ("Price", "current_price"), ("History", "price_history")]:
@@ -913,6 +979,7 @@ with tab_decision:
     mr = market_ready or {}
     target = mr.get("target", {})
     risk = mr.get("risk", {})
+    risk_case = mr.get("risk_case", {})
     conf = mr.get("confidence", {})
     dq = mr.get("data_quality", {})
     tech = mr.get("technical", {})
@@ -923,29 +990,44 @@ with tab_decision:
     momentum = mr.get("momentum", {})
     reliability = mr.get("source_reliability", {})
     sector_val = mr.get("sector_valuation", {})
+    trigger_review = mr.get("trigger_review", {})
     explain = mr.get("explainability", {})
 
-    d1, d2, d3, d4, d5 = st.columns(5)
+    d1, d2, d3, d4, d5, d6, d7 = st.columns(7)
     with d1:
         st.metric("Blended Target", fmt(target.get("target_price"), prefix="₹", dec=0))
     with d2:
         st.metric("Target Upside", fmt(target.get("upside_pct"), "%"))
     with d3:
-        st.metric("Signal Confidence", f"{fmt(conf.get('score'), dec=0)} / 100", conf.get("rating", ""))
+        st.metric("Risk Case Price", fmt(risk_case.get("risk_price"), prefix="₹", dec=0))
     with d4:
-        st.metric("Risk Score", f"{fmt(risk.get('score'), dec=0)} / 100", risk.get("rating", ""))
+        st.metric("If Risk Hits", fmt(risk_case.get("downside_pct"), "%"))
     with d5:
+        st.metric("Risk Score", f"{fmt(risk.get('score'), dec=0)} / 100", risk.get("rating", ""))
+    with d6:
+        st.metric("Confidence", f"{fmt(conf.get('score'), dec=0)} / 100", conf.get("rating", ""))
+    with d7:
         st.metric("Data Quality", f"{fmt(dq.get('score'), dec=0)} / 100", dq.get("rating", ""))
 
     c_left, c_right = st.columns([1.25, 1])
     with c_left:
         signal_txt = dcf_result.get("signal", "N/A") if dcf_result else "N/A"
+        target_rating = target.get("rating", signal_txt)
+        risk_reward = risk_case.get("risk_reward_ratio")
         st.markdown(
             f'<div class="card">'
             f'<div style="font-size:13px;font-weight:700;color:#E2E8F0;margin-bottom:10px;">Target Price Bridge</div>'
             f'<div style="font-size:12px;color:#B0BCC8;line-height:1.8;">'
-            f'Final signal: <strong style="color:#7EB8F7;">{signal_txt}</strong><br>'
+            f'Fundamental rating: <strong style="color:#7EB8F7;">{target_rating}</strong> '
+            f'over <strong>{target.get("horizon", "2 years")}</strong> | Signal: <strong>{signal_txt}</strong><br>'
             f'Confidence: <strong>{conf.get("rating","N/A")}</strong> | Risk: <strong>{risk.get("rating","N/A")}</strong><br>'
+            f'Target price: <strong style="color:#27AE60;">{fmt(target.get("target_price"), prefix="₹", dec=0)}</strong> '
+            f'({fmt(target.get("upside_pct"), "%")}) | '
+            f'Risk case: <strong style="color:#E74C3C;">{fmt(risk_case.get("risk_price"), prefix="₹", dec=0)}</strong> '
+            f'({fmt(risk_case.get("downside_pct"), "%")})<br>'
+            f'Risk/reward: <strong>{fmt(risk_reward, "x", dec=2)}</strong> | '
+            f'Risk haircut used: <strong>{fmt(risk_case.get("haircut_pct"), "%")}</strong><br>'
+            f'Methodology: <strong>{target.get("methodology", "DCF + relative valuation + sector model")}</strong><br>'
             f'Sector model: <strong>{sector_val.get("sector_model","N/A")}</strong>'
             f' | Revision: <strong>{revision.get("rating","N/A")}</strong><br>'
             f'Momentum: <strong>{momentum.get("rating", tech.get("rating","Unavailable"))}</strong>'
@@ -959,12 +1041,26 @@ with tab_decision:
         )
         components = target.get("components")
         if components is not None and not components.empty:
+            target_cols = [c for c in ["Method", "Target", "Weight %", "Note"] if c in components.columns]
             st.dataframe(
-                components[["Model", "Target", "Weight %", "Note"]].set_index("Model"),
+                components[["Model"] + target_cols].set_index("Model"),
                 use_container_width=True,
             )
         else:
             st.info("Target price bridge is unavailable because valuation inputs are incomplete.")
+
+        risk_components = risk_case.get("components")
+        if risk_components is not None and not risk_components.empty:
+            st.markdown("**Risk Case Inputs**")
+            st.dataframe(
+                risk_components[["Scenario Input", "Price", "Weight %", "Note"]].set_index("Scenario Input"),
+                use_container_width=True,
+            )
+
+        trigger_table = trigger_review.get("table")
+        if trigger_table is not None and not trigger_table.empty:
+            st.markdown("**Earnings, Sector & Macro Triggers**")
+            st.dataframe(trigger_table, use_container_width=True, hide_index=True)
 
     with c_right:
         reasons = risk.get("reasons", [])
