@@ -5,7 +5,7 @@ import pandas as pd
 
 from .exchange_source import fetch_exchange_events
 from .screener_source import fetch_fundamentals, fetch_peers
-from .yahoo_source import fetch_market_data
+from .yahoo_source import fetch_fundamentals_from_yahoo, fetch_market_data
 from scraper import normalize_ticker
 from snapshot_store import SnapshotStore
 
@@ -116,7 +116,14 @@ def _snapshot_fallback(ticker: str, error: Exception) -> dict:
                 pass
 
     if not snapshot:
-        raise error
+        try:
+            data = fetch_fundamentals_from_yahoo(canonical)
+        except Exception:
+            raise error
+        data.setdefault("source_status", {})
+        data.setdefault("data_quality_notes", [])
+        data["source_status"]["Screener.in"] = f"unavailable: {error}"
+        return data
 
     data = dict(snapshot.get("data") or {})
     data.setdefault("ticker", canonical)
